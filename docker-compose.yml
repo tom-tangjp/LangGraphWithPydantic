@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  # LangGraph 多智能体应用
+  langgraph-agent:
+    build: .
+    container_name: langgraph-agent
+    ports:
+      - "8000:8000"  # Chainlit
+      - "8501:8501"   # Streamlit
+    environment:
+      - WORKSPACE.ROOT=/workspace
+      - SKILLS.DIR=/app/skills
+      - LOG.LEVEL=INFO
+      # LLM 配置（根据需要修改）
+      - INTENT.PROVIDER=qwen
+      - INTENT.MODEL=qwen2-1.5b-instruct
+      - PLANNER.PROVIDER=qwen
+      - PLANNER.MODEL=qwen-max
+      - AGENT.PROVIDER=qwen
+      - AGENT.MODEL=qwen-max
+      - SEARCH.BACKEND=searxng
+    volumes:
+      # 挂载工作空间
+      - ./workspace:/workspace:rw
+      # 挂载技能目录
+      - ./skills:/app/skills:rw
+      # 挂载日志
+      - ./logs:/app/logs:rw
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # SearXNG 搜索后端（可选）
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    ports:
+      - "8080:8080"
+    environment:
+      - BASE_URL=http://searxng:8080/
+    restart: unless-stopped
+    volumes:
+      - ./searxng-docker/searxng:/etc/searxng:ro
+
+networks:
+  default:
+    name: langgraph-network

@@ -1,0 +1,65 @@
+{
+  "llm": {
+    "providers": {
+      "qwen": {
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "api_key": ""
+      },
+      "doubao": {
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "api_key": ""
+      },
+      "yuanbao": {
+        "base_url": "",
+        "api_key": ""
+      },
+      "openai": {
+        "base_url": "",
+        "api_key": ""
+      },
+      "openai_compat": {
+        "base_url": "",
+        "api_key": ""
+      },
+      "ollama": {
+        "base_url": "http://localhost:11434",
+        "api_key": ""
+      }
+    }
+  },
+  "workspace": {
+    "root": "/path/to/work_space"
+  },
+  "skills": {
+    "dir": "./skills"
+  },
+  "search": {
+    "backend": "searxng"
+  },
+  "searxng": {
+    "url": "http://localhost:8080"
+  },
+  "log": {
+    "level": "INFO",
+    "llm": {
+      "content": 1
+    }
+  },
+  "python": {
+    "io": {
+      "encoding": "utf-8"
+    }
+  },
+  "intent": {
+    "provider": "qwen",
+    "model": "qwen-plus"
+  },
+  "planner": {
+    "provider": "qwen",
+    "model": "qwen-plus"
+  },
+  "agent": {
+    "provider": "qwen",
+    "model": "qwen-plus"
+  }
+}
