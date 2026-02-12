@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -11,7 +12,6 @@ from typing import Dict, List, Any
 from langchain_core.tools import tool
 
 import utils
-from skills_registry import WORKSPACE_ROOT
 from web_tools import web_search, web_open, http_get
 
 logger = logging.getLogger(__name__)
@@ -21,17 +21,18 @@ def _resolve_under_root(path: str) -> Path:
     """
     解析路径为相对于 WORKSPACE_ROOT 的绝对路径。
     """
+    workspace_root = utils.get_workspace_root()
     p = Path(path).expanduser()
     if not p.is_absolute():
-        p = WORKSPACE_ROOT / p
+        p = workspace_root / p
 
     rp = p.resolve()
 
     # 必须位于 WORKSPACE_ROOT 内
     try:
-        rp.relative_to(WORKSPACE_ROOT)
+        rp.relative_to(workspace_root)
     except ValueError:
-        raise ValueError(f"path escapes workspace root: {rp} (root={WORKSPACE_ROOT})")
+        raise ValueError(f"path escapes workspace root: {rp} (root={workspace_root})")
 
     return rp
 
@@ -44,20 +45,20 @@ def _get_search_root(path: str) -> Path:
     - 绝对路径直接使用
     """
     if not path or path == ".":
-        return WORKSPACE_ROOT
+        return utils.get_workspace_root()
     return _resolve_under_root(path)
 
-
-@tool("read_text_file")
-def read_text_file(path: str, start: int = 0, max_chars: int = 12000) -> str:
-    """Read a UTF-8 text file under WORKSPACE_ROOT. Returns a substring [start:start+max_chars]."""
+@utils.timer
+@tool("read_file")
+def read_file(path: str, start: int = 0, max_chars: int = 12000) -> str:
+    """Read a UTF-8 file under WORKSPACE_ROOT. Returns a substring [start:start+max_chars]."""
     fp = _resolve_under_root(path)
     data = fp.read_text(encoding="utf-8", errors="replace")
     if start < 0:
         start = 0
     return data[start: start + max_chars]
 
-
+@utils.timer
 @tool("list_dir")
 def list_dir(path: str = ".", max_entries: int = 200) -> List[str]:
     """List directory entries under WORKSPACE_ROOT."""
@@ -69,7 +70,7 @@ def list_dir(path: str = ".", max_entries: int = 200) -> List[str]:
         out.append(child.name + ("/" if child.is_dir() else ""))
     return out
 
-
+@utils.timer
 @tool("ensure_dir")
 def ensure_dir(path: str) -> str:
     """Create a directory under WORKSPACE_ROOT if not exists."""
@@ -77,7 +78,7 @@ def ensure_dir(path: str) -> str:
     try:
         dp.mkdir(parents=True, exist_ok=True)
         return json.dumps(
-            {"ok": True, "path": str(dp.relative_to(WORKSPACE_ROOT))},
+            {"ok": True, "path": str(dp.relative_to(utils.get_workspace_root()))},
             ensure_ascii=False,
         )
     except Exception as e:
@@ -86,7 +87,7 @@ def ensure_dir(path: str) -> str:
             ensure_ascii=False,
         )
 
-
+@utils.timer
 @tool("write_text_file")
 def write_text_file(
         path: str, content: str, mode: str = "overwrite", encoding: str = "utf-8"
@@ -103,7 +104,7 @@ def write_text_file(
             return json.dumps(
                 {
                     "ok": True,
-                    "path": str(fp.relative_to(WORKSPACE_ROOT)),
+                    "path": str(fp.relative_to(utils.get_workspace_root())),
                     "bytes": len((content or "").encode(encoding, errors="replace")),
                     "mode": "append",
                 },
@@ -117,7 +118,7 @@ def write_text_file(
         return json.dumps(
             {
                 "ok": True,
-                "path": str(fp.relative_to(WORKSPACE_ROOT)),
+                "path": str(fp.relative_to(utils.get_workspace_root())),
                 "bytes": len((content or "").encode(encoding, errors="replace")),
                 "mode": "overwrite",
             },
@@ -129,7 +130,7 @@ def write_text_file(
             ensure_ascii=False,
         )
 
-
+@utils.timer
 @tool("grep_text")
 def grep_text(
         pattern: str, path: str = ".", max_matches: int = 50, max_file_size_kb: int = 512
@@ -167,7 +168,7 @@ def grep_text(
             if rx.search(line):
                 # 计算相对路径
                 try:
-                    rel_path = str(fp.relative_to(WORKSPACE_ROOT))
+                    rel_path = str(fp.relative_to(utils.get_workspace_root()))
                 except ValueError:
                     rel_path = str(fp)
                 matches.append(
@@ -208,58 +209,227 @@ def build_tool_registry(tools: List[Any]) -> Dict[str, Any]:
 
 # 允许的安全命令列表（仅限代码分析、测试、格式化等开发任务）
 _SAFE_COMMANDS = {
-    "python": ["-m", "py_compile"],  # 语法检查
-    "pytest": [],  # 运行测试
-    "black": [],  # 代码格式化
-    "flake8": [],  # 静态分析
-    "isort": [],  # import排序
-    "pip": ["install", "uninstall", "list", "freeze"],  # 依赖管理
+    # python：仅允许少数只读/语法检查用法；更细粒度校验见 _is_safe_python_cmd
+    "python": ["-m", "py_compile", "-V", "--version"],
+    "python3": ["-m", "py_compile", "-V", "--version"],
+    # 测试/静态检查/格式化：允许任意参数（由对应工具/CI兜底）
+    "pytest": [],
+    "black": [],
+    "flake8": [],
+    "isort": [],
+    # pip：默认只读（show/list/freeze）；写入类动作由 MCP_ALLOW_PIP_WRITE gate
+    "pip": ["show", "list", "freeze", "install", "uninstall"],
 }
 
+_ALLOW_PIP_WRITE = os.environ.get("MCP_ALLOW_PIP_WRITE", "0") == "1"
+_ALLOW_PYTHON_C = os.environ.get("MCP_ALLOW_PYTHON_C", "0") == "1"
+
+# 允许的 python -c one-liner 白名单（可按需扩展；默认关闭）
+_PYTHON_C_ALLOWLIST = {
+}
+
+def _is_safe_python_cmd(cmd_parts: List[str]) -> bool:
+    """
+    更严格的 python 校验：
+    - 允许: python --version / -V
+    - 允许: python -m py_compile <file1> [file2...]
+    - 允许: python -m pytest ...
+    - 可选: python -c <one-liner>（需 MCP_ALLOW_PYTHON_C=1 且命中白名单）
+    其他全部拒绝。
+    """
+    if not cmd_parts:
+        return False
+    # python --version / -V
+    if len(cmd_parts) == 2 and cmd_parts[1] in ("--version", "-V"):
+        return True
+
+    # python -c "<one-liner>" (optional)
+    if len(cmd_parts) >= 3 and cmd_parts[1] == "-c":
+        if not _ALLOW_PYTHON_C:
+            return False
+
+        if len(_PYTHON_C_ALLOWLIST) == 0:
+            return True
+
+        one_liner = cmd_parts[2]
+        return one_liner in _PYTHON_C_ALLOWLIST
+
+    # python [interp_flags...] -m (py_compile|pytest) ...
+    i = 1
+    while i < len(cmd_parts) and cmd_parts[i].startswith("-") and cmd_parts[i] not in ("-m", "-c"):
+        i += 1
+    if i + 1 >= len(cmd_parts) or cmd_parts[i] != "-m":
+        return False
+    module = cmd_parts[i + 1]
+    if module not in ("py_compile", "pytest"):
+        return False
+    # python -m pytest ... : treat as safe (equivalent to `pytest`)
+    if module == "pytest":
+        return True
+    # python -m py_compile ...
+    j = i + 2
+    has_file = False
+    while j < len(cmd_parts):
+        a = cmd_parts[j]
+        if a.startswith("-"):
+            j += 1
+            continue
+        try:
+            _resolve_under_root(a)
+        except Exception:
+            return False
+        has_file = True
+        j += 1
+    return has_file
+
+def _is_safe_pip_cmd(cmd_parts: List[str]) -> bool:
+    """
+    pip 安全校验：
+    - 默认允许只读: pip --version/-V, pip show/list/freeze
+    - 写入类: pip install/uninstall 仅在 MCP_ALLOW_PIP_WRITE=1 时允许
+    """
+    if not cmd_parts:
+        return False
+    if len(cmd_parts) == 2 and cmd_parts[1] in ("--version", "-V"):
+        return True
+    if len(cmd_parts) < 2:
+        return False
+    sub = cmd_parts[1]
+    readonly = {"show", "list", "freeze"}
+    write_ops = {"install", "uninstall"}
+    if sub in readonly:
+        return True
+    if sub in write_ops:
+        return _ALLOW_PIP_WRITE
+    return False
+
+_SAFE_PYTHON_MODULES = {"py_compile"}  # 只允许这些 -m 模块
+_SAFE_PYTHON_FLAGS = {"-V", "--version"}
+
+# 如果你确实想要 python -c，一定要做白名单，而不是放开任意代码
+_SAFE_PYTHON_C_ALLOWLIST = {
+    "import sys; print(sys.version)",
+    "import sys; print(sys.executable)",
+}
+
+def _is_under_workspace(path_str: str) -> bool:
+    try:
+        _resolve_under_root(path_str)  # 会校验不逃逸 WORKSPACE_ROOT
+        return True
+    except Exception:
+        return False
+
+def _is_safe_python_command(cmd_parts: List[str]) -> bool:
+    # 1) python --version / -V
+    if len(cmd_parts) == 2 and cmd_parts[1] in _SAFE_PYTHON_FLAGS:
+        return True
+
+    # 2) python -c "<one-liner>"（严格白名单）
+    if len(cmd_parts) == 3 and cmd_parts[1] == "-c" and cmd_parts[2] in _SAFE_PYTHON_C_ALLOWLIST:
+        return True
+
+    # 3) python -m py_compile <file...>（允许多个文件；文件必须在 workspace 内）
+    if len(cmd_parts) >= 4 and cmd_parts[1] == "-m" and cmd_parts[2] in _SAFE_PYTHON_MODULES:
+        for arg in cmd_parts[3:]:
+            if arg.startswith("-"):
+                continue  # 例如 py_compile 的 -q
+            if not _is_under_workspace(arg):
+                return False
+        return True
+
+    return False
 
 def _is_safe_command(cmd_parts: List[str]) -> bool:
-    """检查命令是否在安全列表中"""
+    """检查命令是否在安全列表中（更严格的 python/pip 规则）。"""
     if not cmd_parts:
         return False
     base_cmd = cmd_parts[0]
     if base_cmd not in _SAFE_COMMANDS:
         return False
+
+    if base_cmd in ("python", "python3"):
+        return _is_safe_python_cmd(cmd_parts)
+    if base_cmd == "pip":
+        return _is_safe_pip_cmd(cmd_parts)
+
     allowed_args = _SAFE_COMMANDS[base_cmd]
-    # 如果没有限制参数，则允许所有参数
     if not allowed_args:
         return True
 
-    # 特殊处理 python 命令：允许 -m 后面的任何参数
-    if base_cmd == "python":
-        i = 1
-        while i < len(cmd_parts):
-            arg = cmd_parts[i]
-            if arg.startswith("-"):
-                # 如果是 -m，跳过下一个参数（模块名）
-                if arg == "-m" and i + 1 < len(cmd_parts):
-                    i += 2
-                    continue
-                i += 1
-                continue
-            # 检查参数是否以允许的参数开头
-            if not any(
-                    allowed_arg.startswith(arg.split("=")[0])
-                    for allowed_arg in allowed_args
-            ):
-                return False
-            i += 1
+    # 对于其他命令，仅校验“第一个非 flag 参数”（子命令）；其余参数放行
+    subcmd = None
+    for a in cmd_parts[1:]:
+        if a.startswith("-"):
+            continue
+        subcmd = a
+        break
+    if subcmd is None:
         return True
+    return any(allowed_arg == subcmd or allowed_arg.startswith(subcmd) for allowed_arg in allowed_args)
 
-    # 对于其他命令，检查参数是否在允许列表中（允许部分匹配）
-    for arg in cmd_parts[1:]:
-        if arg.startswith("-"):
-            continue  # 允许所有选项标志
-        if not any(
-                allowed_arg.startswith(arg.split("=")[0]) for allowed_arg in allowed_args
-        ):
-            return False
-    return True
+@utils.timer
+@tool("git_status")
+def git_status(porcelain: bool = True) -> str:
+    """Get git status for WORKSPACE_ROOT (read-only)."""
+    repo = utils.get_workspace_root()
+    if not (repo / ".git").exists():
+        return json.dumps({"ok": False, "error": "WORKSPACE_ROOT is not a git repo"}, ensure_ascii=False)
+    args = ["git", "-C", str(repo), "status"]
+    if porcelain:
+        args += ["--porcelain=v1", "--untracked-files=all"]
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=20)
+        out = (p.stdout or "") + (p.stderr or "")
+        return json.dumps({"ok": p.returncode == 0, "output": out}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}", "output": ""}, ensure_ascii=False)
 
+@utils.timer
+@tool("git_diff")
+def git_diff(paths: List[str] = None, staged: bool = False, max_chars: int = 60000) -> str:
+    """Get git diff (read-only). Optionally limit to paths under WORKSPACE_ROOT."""
+    repo = utils.get_workspace_root()
+    if not (repo / ".git").exists():
+        return json.dumps({"ok": False, "error": "WORKSPACE_ROOT is not a git repo"}, ensure_ascii=False)
+    args = ["git", "-C", str(repo), "diff"]
+    if staged:
+        args.append("--staged")
+    args += ["--no-color"]
+    safe_paths: List[str] = []
+    if paths:
+        for pth in paths:
+            fp = _resolve_under_root(pth)
+            safe_paths.append(str(fp.relative_to(repo)))
+    if safe_paths:
+        args.append("--")
+        args.extend(safe_paths)
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        out = (p.stdout or "") + (p.stderr or "")
+        if len(out) > int(max_chars):
+            out = out[: int(max_chars)] + "\n...[truncated]"
+        return json.dumps({"ok": p.returncode == 0, "output": out}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}", "output": ""}, ensure_ascii=False)
+
+@utils.timer
+@tool("git_show")
+def git_show(spec: str = "HEAD", max_chars: int = 60000) -> str:
+    """Show a commit or object (read-only). Example: HEAD, HEAD~1, <sha>."""
+    repo = utils.get_workspace_root()
+    if not (repo / ".git").exists():
+        return json.dumps({"ok": False, "error": "WORKSPACE_ROOT is not a git repo"}, ensure_ascii=False)
+    if not re.match(r"^[A-Za-z0-9_./~^:-]{1,80}$", spec or ""):
+        return json.dumps({"ok": False, "error": "invalid git spec"}, ensure_ascii=False)
+    args = ["git", "-C", str(repo), "show", "--no-color", "--stat", "--patch", spec]
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        out = (p.stdout or "") + (p.stderr or "")
+        if len(out) > int(max_chars):
+            out = out[: int(max_chars)] + "\n...[truncated]"
+        return json.dumps({"ok": p.returncode == 0, "output": out}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}", "output": ""}, ensure_ascii=False)
 
 def _run_safe_command(command: str, timeout: int = 30) -> str:
     """
@@ -303,7 +473,7 @@ def _run_safe_command(command: str, timeout: int = 30) -> str:
         )
 
     # 确保在workspace目录下执行
-    cwd = WORKSPACE_ROOT
+    cwd = utils.get_workspace_root()
     if not cwd.exists():
         return json.dumps(
             {
@@ -358,13 +528,13 @@ def _run_safe_command(command: str, timeout: int = 30) -> str:
             ensure_ascii=False,
         )
 
-
+@utils.timer
 @tool("run_safe_command")
 def run_safe_command(command: str, timeout: int = 30) -> str:
     """在workspace内运行安全的命令（如python, pytest, black等）。只允许执行预定义的安全命令列表，防止任意命令执行。"""
     return _run_safe_command(command, timeout)
 
-
+@utils.timer
 @tool("analyze_code")
 def analyze_code(path: str = ".", tool_name: str = "flake8") -> str:
     """
@@ -417,12 +587,12 @@ def analyze_code(path: str = ".", tool_name: str = "flake8") -> str:
             "ok": True,
             "output": result_dict.get("stdout", ""),
             "tool": tool_name,
-            "path": str(fp.relative_to(WORKSPACE_ROOT)),
+            "path": str(fp.relative_to(utils.get_workspace_root())),
         },
         ensure_ascii=False,
     )
 
-
+@utils.timer
 @tool("run_tests")
 def run_tests(path: str = "tests", options: str = "-v") -> str:
     """
@@ -469,12 +639,12 @@ def run_tests(path: str = "tests", options: str = "-v") -> str:
             "exit_code": result_dict.get("exit_code", -1),
             "output": output,
             "stats": stats,
-            "path": str(fp.relative_to(WORKSPACE_ROOT)),
+            "path": str(fp.relative_to(utils.get_workspace_root())),
         },
         ensure_ascii=False,
     )
 
-
+@utils.timer
 @tool("format_code")
 def format_code(path: str = ".", formatter: str = "black") -> str:
     """
@@ -516,12 +686,12 @@ def format_code(path: str = ".", formatter: str = "black") -> str:
             "ok": result_dict.get("ok", False),
             "output": result_dict.get("stdout", "") + result_dict.get("stderr", ""),
             "formatter": formatter,
-            "path": str(fp.relative_to(WORKSPACE_ROOT)),
+            "path": str(fp.relative_to(utils.get_workspace_root())),
         },
         ensure_ascii=False,
     )
 
-
+@utils.timer
 @tool("check_syntax")
 def check_syntax(path: str) -> str:
     """
@@ -554,12 +724,12 @@ def check_syntax(path: str) -> str:
         {
             "ok": result_dict.get("ok", False),
             "output": result_dict.get("stdout", "") + result_dict.get("stderr", ""),
-            "path": str(fp.relative_to(WORKSPACE_ROOT)),
+            "path": str(fp.relative_to(utils.get_workspace_root())),
         },
         ensure_ascii=False,
     )
 
-
+@utils.timer
 @tool("extract_functions")
 def extract_functions(path: str) -> str:
     """
@@ -604,7 +774,7 @@ def extract_functions(path: str) -> str:
                 "ok": True,
                 "functions": functions,
                 "count": len(functions),
-                "path": str(fp.relative_to(WORKSPACE_ROOT)),
+                "path": str(fp.relative_to(utils.get_workspace_root())),
             },
             ensure_ascii=False,
         )
@@ -618,7 +788,7 @@ def extract_functions(path: str) -> str:
             ensure_ascii=False,
         )
 
-
+@utils.timer
 @tool("get_code_metrics")
 def get_code_metrics(path: str = ".") -> str:
     """
@@ -670,7 +840,7 @@ def get_code_metrics(path: str = ".") -> str:
 
             file_metrics.append(
                 {
-                    "file": str(py_file.relative_to(WORKSPACE_ROOT)),
+                    "file": str(py_file.relative_to(utils.get_workspace_root())),
                     "lines": lines,
                     "functions": len(functions),
                     "classes": len(classes),
@@ -694,12 +864,12 @@ def get_code_metrics(path: str = ".") -> str:
                 "avg_lines_per_file": round(avg_lines_per_file, 2),
             },
             "file_details": file_metrics,
-            "path": str(fp.relative_to(WORKSPACE_ROOT)),
+            "path": str(fp.relative_to(utils.get_workspace_root())),
         },
         ensure_ascii=False,
     )
 
-
+@utils.timer
 @tool("save_mermaid_diagram")
 def save_mermaid_diagram(mermaid_code: str, filename: str = "diagram.md") -> str:
     """
@@ -726,8 +896,8 @@ def save_mermaid_diagram(mermaid_code: str, filename: str = "diagram.md") -> str
         return json.dumps(
             {
                 "ok": True,
-                "path": str(fp.relative_to(WORKSPACE_ROOT)),
-                "message": f"Mermaid diagram saved to {fp.relative_to(WORKSPACE_ROOT)}",
+                "path": str(fp.relative_to(utils.get_workspace_root())),
+                "message": f"Mermaid diagram saved to {fp.relative_to(utils.get_workspace_root())}",
             },
             ensure_ascii=False,
         )
@@ -742,7 +912,7 @@ def save_mermaid_diagram(mermaid_code: str, filename: str = "diagram.md") -> str
             ensure_ascii=False,
         )
 
-
+@utils.timer
 @tool("generate_diagram_description")
 def generate_diagram_description(
         description: str, diagram_type: str = "flowchart"
@@ -776,7 +946,7 @@ def generate_diagram_description(
         ensure_ascii=False,
     )
 
-
+@utils.timer
 @tool("create_plotly_chart")
 def create_plotly_chart(
         chart_type: str,
@@ -918,10 +1088,10 @@ def create_plotly_chart(
         return json.dumps(
             {
                 "ok": True,
-                "path": str(fp.relative_to(WORKSPACE_ROOT)),
+                "path": str(fp.relative_to(utils.get_workspace_root())),
                 "filename": filename,
                 "chart_type": chart_type,
-                "message": f"Plotly {chart_type} chart saved to {fp.relative_to(WORKSPACE_ROOT)}",
+                "message": f"Plotly {chart_type} chart saved to {fp.relative_to(utils.get_workspace_root())}",
             },
             ensure_ascii=False,
         )
@@ -937,7 +1107,7 @@ def create_plotly_chart(
             ensure_ascii=False,
         )
 
-
+@utils.timer
 @tool("save_chart_data")
 def save_chart_data(
         data: str, filename: str = "chart_data.json", format: str = "json"
@@ -986,10 +1156,10 @@ def save_chart_data(
         return json.dumps(
             {
                 "ok": True,
-                "path": str(fp.relative_to(WORKSPACE_ROOT)),
+                "path": str(fp.relative_to(utils.get_workspace_root())),
                 "filename": filename,
                 "format": format,
-                "message": f"Chart data saved to {fp.relative_to(WORKSPACE_ROOT)}",
+                "message": f"Chart data saved to {fp.relative_to(utils.get_workspace_root())}",
             },
             ensure_ascii=False,
         )
@@ -1000,7 +1170,7 @@ def save_chart_data(
             ensure_ascii=False,
         )
 
-
+@utils.timer
 @tool("analyze_data_for_chart")
 def analyze_data_for_chart(data: str, description: str = "") -> str:
     """
@@ -1199,6 +1369,7 @@ COMMON_SOURCE_EXTENSIONS = [
     ".rb", ".php", ".cs", ".swift", ".lua", ".pl", ".pm"
 ]
 
+@utils.timer
 @tool("read_source_file")
 def read_source_file(path: str, start: int = 0, max_chars: int = 100 * 1024 * 1024) -> str:
     """读取源代码文件，支持多种语言 (C++, Go, Python, Java, TS 等)。支持大文件分块读取。"""
@@ -1222,7 +1393,7 @@ def read_source_file(path: str, start: int = 0, max_chars: int = 100 * 1024 * 10
         lines = data[:start + max_chars].count("\n") + 1
         return json.dumps({
             "ok": True,
-            "path": str(fp.relative_to(WORKSPACE_ROOT)),
+            "path": str(fp.relative_to(utils.get_workspace_root())),
             "content": content,
             "total_chars": len(data),
             "total_lines": lines,
@@ -1302,6 +1473,7 @@ def _normalize_extensions(
             norm.append(e)
     return norm if norm else default_exts
 
+@utils.timer
 @tool("list_source_files")
 def list_source_files(path: str, max_files: int = 500, extensions: Optional[Union[List[str], str]] = None) -> str:
     """递归列出目录下的源代码文件。
@@ -1331,7 +1503,7 @@ def list_source_files(path: str, max_files: int = 500, extensions: Optional[Unio
         
         if fp.suffix.lower() in target_exts:
              try:
-                rel_path = str(fp.relative_to(WORKSPACE_ROOT))
+                rel_path = str(fp.relative_to(utils.get_workspace_root()))
                 source_files.append(rel_path)
              except ValueError:
                 continue
@@ -1348,14 +1520,14 @@ def list_source_files(path: str, max_files: int = 500, extensions: Optional[Unio
         import time
         ts = int(time.time())
         list_filename = f"source_files_list_{ts}.json"
-        list_path = WORKSPACE_ROOT / "tmp" / list_filename
-        (WORKSPACE_ROOT / "tmp").mkdir(parents=True, exist_ok=True)
+        list_path = utils.get_workspace_root() / "tmp" / list_filename
+        (utils.get_workspace_root() / "tmp").mkdir(parents=True, exist_ok=True)
 
         with open(list_path, "w", encoding="utf-8") as f:
             json.dump(source_files, f, ensure_ascii=False, indent=2)
 
         try:
-            result["files_list_path"] = str(list_path.relative_to(WORKSPACE_ROOT))
+            result["files_list_path"] = str(list_path.relative_to(utils.get_workspace_root()))
         except ValueError:
             result["files_list_path"] = str(list_path)
 
@@ -1366,7 +1538,7 @@ def list_source_files(path: str, max_files: int = 500, extensions: Optional[Unio
 
     return json.dumps(result, ensure_ascii=False)
 
-
+@utils.timer
 @tool("grep_source_code")
 def grep_source_code(pattern: str, path: str, max_matches: int = 100, extensions: Optional[Union[List[str], str]] = None) -> str:
     """在源代码文件中搜索正则表达式。
@@ -1401,7 +1573,7 @@ def grep_source_code(pattern: str, path: str, max_matches: int = 100, extensions
             for i, line in enumerate(fp.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
                 if rx.search(line):
                     try:
-                        rel_path = str(fp.relative_to(WORKSPACE_ROOT))
+                        rel_path = str(fp.relative_to(utils.get_workspace_root()))
                     except ValueError:
                         rel_path = str(fp)
                     matches.append({
@@ -1419,7 +1591,7 @@ def grep_source_code(pattern: str, path: str, max_matches: int = 100, extensions
         "matches": matches[:max_matches]
     }, ensure_ascii=False)
 
-
+@utils.timer
 @tool("extract_cpp_functions")
 def extract_cpp_functions(path: str) -> str:
     """从 C/C++ 文件中提取函数签名、类和方法。"""
@@ -1472,13 +1644,13 @@ def extract_cpp_functions(path: str) -> str:
 
     return json.dumps({
         "ok": True,
-        "path": str(fp.relative_to(WORKSPACE_ROOT)),
+        "path": str(fp.relative_to(utils.get_workspace_root())),
         "functions": functions,
         "classes": classes,
         "includes": list(set(includes))[:20]
     }, ensure_ascii=False)
 
-
+@utils.timer
 @tool("get_source_metrics")
 def get_source_metrics(path: str) -> str:
     """获取项目的代码度量信息 (Lines of Code, Files, etc.)。"""
@@ -1532,7 +1704,7 @@ def get_source_metrics(path: str) -> str:
                 total_classes_approx += content.count("class ") + content.count("struct ") + content.count("interface ")
 
             files_info.append({
-                "file": str(fp.relative_to(WORKSPACE_ROOT)),
+                "file": str(fp.relative_to(utils.get_workspace_root())),
                 "lines": len(lines),
                 "code_lines": code_lines_count
             })
@@ -1549,7 +1721,7 @@ def get_source_metrics(path: str) -> str:
         "files": files_info[:100]
     }, ensure_ascii=False)
 
-
+@utils.timer
 @tool("run_cpp_linter")
 def run_cpp_linter(path: str, tool_name: str = "clang-tidy") -> str:
     """运行 C++ 静态分析工具 (clang-tidy, cppcheck)。
@@ -1592,7 +1764,7 @@ def run_cpp_linter(path: str, tool_name: str = "clang-tidy") -> str:
         return json.dumps({
             "ok": True,
             "tool": tool_name,
-            "path": str(fp.relative_to(WORKSPACE_ROOT)),
+            "path": str(fp.relative_to(utils.get_workspace_root())),
             "output": result.stdout[:10000] + ("..." if len(result.stdout) > 10000 else ""),
             "errors": result.stderr[:5000] if result.stderr else ""
         }, ensure_ascii=False)
@@ -1601,7 +1773,7 @@ def run_cpp_linter(path: str, tool_name: str = "clang-tidy") -> str:
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
-
+@utils.timer
 @tool("check_cpp_syntax")
 def check_cpp_syntax(path: str, compiler: str = "clang++", std: str = "c++17") -> str:
     """通过编译检查 C/C++ 语法正确性。"""
@@ -1620,7 +1792,7 @@ def check_cpp_syntax(path: str, compiler: str = "clang++", std: str = "c++17") -
         return json.dumps({
             "ok": result.returncode == 0,
             "compiler": compiler,
-            "path": str(fp.relative_to(WORKSPACE_ROOT)),
+            "path": str(fp.relative_to(utils.get_workspace_root())),
             "output": result.stderr if result.stderr else "编译检查通过",
             "exit_code": result.returncode
         }, ensure_ascii=False)
@@ -1631,7 +1803,7 @@ def check_cpp_syntax(path: str, compiler: str = "clang++", std: str = "c++17") -
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
-
+@utils.timer
 @tool("format_cpp")
 def format_cpp(path: str, style: str = "llvm") -> str:
     """使用 clang-format 格式化 C/C++ 代码。"""
@@ -1658,9 +1830,9 @@ def format_cpp(path: str, style: str = "llvm") -> str:
 
             return json.dumps({
                 "ok": True,
-                "path": str(fp.relative_to(WORKSPACE_ROOT)),
+                "path": str(fp.relative_to(utils.get_workspace_root())),
                 "style": style,
-                "backup": str(backup.relative_to(WORKSPACE_ROOT)),
+                "backup": str(backup.relative_to(utils.get_workspace_root())),
                 "message": "代码已格式化"
             }, ensure_ascii=False)
         else:
@@ -1673,7 +1845,7 @@ def format_cpp(path: str, style: str = "llvm") -> str:
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
-
+@utils.timer
 @tool("find_cmake_files")
 def find_cmake_files(path: str) -> str:
     """查找 CMake 项目文件 (CMakeLists.txt, *.cmake)。
@@ -1692,7 +1864,7 @@ def find_cmake_files(path: str) -> str:
         if fp.is_file():
             name = fp.name
             if name == "CMakeLists.txt" or name.endswith(".cmake"):
-                cmake_files.append(str(fp.relative_to(WORKSPACE_ROOT)))
+                cmake_files.append(str(fp.relative_to(utils.get_workspace_root())))
 
     # 查找 compile_commands.json
     compile_db = root / "compile_commands.json"
@@ -1700,13 +1872,13 @@ def find_cmake_files(path: str) -> str:
 
     return json.dumps({
         "ok": True,
-        "path": str(root.relative_to(WORKSPACE_ROOT)),
+        "path": str(root.relative_to(utils.get_workspace_root())),
         "cmake_files": cmake_files,
         "has_compile_commands": has_compile_db,
         "count": len(cmake_files)
     }, ensure_ascii=False)
 
-
+@utils.timer
 @tool("read_compile_commands")
 def read_compile_commands(path: str = "compile_commands.json", json=None) -> str:
     """读取编译数据库文件，分析项目构建配置。"""
@@ -1741,7 +1913,7 @@ def read_compile_commands(path: str = "compile_commands.json", json=None) -> str
 
         return json.dumps({
             "ok": True,
-            "path": str(fp.relative_to(WORKSPACE_ROOT)),
+            "path": str(fp.relative_to(utils.get_workspace_root())),
             "entries_count": len(data),
             "compilers": list(compilers),
             "sample_commands": commands
@@ -1752,62 +1924,63 @@ def read_compile_commands(path: str = "compile_commands.json", json=None) -> str
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
 
-@tool("batch_read_source_files")
-def batch_read_source_files(paths: List[str], max_chars_per_file: int = 50000) -> str:
-    """批量读取多个源代码文件。
-
-    Args:
-        paths: 文件路径列表（相对于 WORKSPACE_ROOT）
-        max_chars_per_file: 每个文件最大读取字符数，默认 50000
-
-    Returns:
-        JSON 字符串包含所有文件的内容
-    """
-    results = []
-
-    for path in paths:
-        fp = _resolve_under_root(path)
-        if not fp.exists():
-            results.append({
-                "path": path,
-                "ok": False,
-                "error": "文件不存在"
-            })
-            continue
-
-        suffix = fp.suffix.lower()
-        if suffix not in COMMON_SOURCE_EXTENSIONS:
-            # 尝试宽松读取
-             pass
-
-        try:
-            content = fp.read_text(encoding="utf-8", errors="replace")
-            results.append({
-                "path": path,
-                "ok": True,
-                "content": content[:max_chars_per_file],
-                "total_chars": len(content),
-                "truncated": len(content) > max_chars_per_file
-            })
-        except Exception as e:
-            results.append({
-                "path": path,
-                "ok": False,
-                "error": str(e)
-            })
-
-    return json.dumps({
-        "ok": True,
-        "total_files": len(paths),
-        "success_count": sum(1 for r in results if r.get("ok")),
-        "results": results
-    }, ensure_ascii=False)
+# @tool("batch_read_source_files")
+# def batch_read_source_files(paths: List[str], max_chars_per_file: int = 50000) -> str:
+#     """批量读取多个源代码文件。
+#
+#     Args:
+#         paths: 文件路径列表（相对于 WORKSPACE_ROOT）
+#         max_chars_per_file: 每个文件最大读取字符数，默认 50000
+#
+#     Returns:
+#         JSON 字符串包含所有文件的内容
+#     """
+#     results = []
+#
+#     for path in paths:
+#         fp = _resolve_under_root(path)
+#         if not fp.exists():
+#             results.append({
+#                 "path": path,
+#                 "ok": False,
+#                 "error": "文件不存在"
+#             })
+#             continue
+#
+#         suffix = fp.suffix.lower()
+#         if suffix not in COMMON_SOURCE_EXTENSIONS:
+#             # 尝试宽松读取
+#              pass
+#
+#         try:
+#             content = fp.read_text(encoding="utf-8", errors="replace")
+#             results.append({
+#                 "path": path,
+#                 "ok": True,
+#                 "content": content[:max_chars_per_file],
+#                 "total_chars": len(content),
+#                 "truncated": len(content) > max_chars_per_file
+#             })
+#         except Exception as e:
+#             results.append({
+#                 "path": path,
+#                 "ok": False,
+#                 "error": str(e)
+#             })
+#
+#     return json.dumps({
+#         "ok": True,
+#         "total_files": len(paths),
+#         "success_count": sum(1 for r in results if r.get("ok")),
+#         "results": results
+#     }, ensure_ascii=False)
 
 
 # ============================================================================
 # Bash 脚本执行工具
 # ============================================================================
 
+@utils.timer
 @tool("run_bash")
 def run_bash(command: str, timeout: int = 60, work_dir: str = ".") -> str:
     """执行 bash 命令。
@@ -1840,7 +2013,7 @@ def run_bash(command: str, timeout: int = 60, work_dir: str = ".") -> str:
         return json.dumps({
             "ok": result.returncode == 0,
             "command": command,
-            "work_dir": str(work_path.relative_to(WORKSPACE_ROOT)),
+            "work_dir": str(work_path.relative_to(utils.get_workspace_root())),
             "exit_code": result.returncode,
             "stdout": result.stdout[:50000] if result.stdout else "",
             "stderr": result.stderr[:10000] if result.stderr else ""
@@ -1863,7 +2036,7 @@ def run_bash(command: str, timeout: int = 60, work_dir: str = ".") -> str:
 # ============================================================================
 # 目录访问工具
 # ============================================================================
-
+@utils.timer
 @tool("get_file_info")
 def get_file_info(path: str) -> str:
     """获取文件或目录的详细信息。
@@ -1892,7 +2065,7 @@ def get_file_info(path: str) -> str:
         is_file = fp.is_file()
 
         info = {
-            "path": str(fp.relative_to(WORKSPACE_ROOT)),
+            "path": str(fp.relative_to(utils.get_workspace_root())),
             "name": fp.name,
             "is_dir": is_dir,
             "is_file": is_file,
@@ -1912,7 +2085,7 @@ def get_file_info(path: str) -> str:
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
-
+@utils.timer
 @tool("read_file_lines")
 def read_file_lines(path: str, start_line: int = 1, end_line: int = 100) -> str:
     """按行读取文件内容。
@@ -1949,7 +2122,7 @@ def read_file_lines(path: str, start_line: int = 1, end_line: int = 100) -> str:
 
         return json.dumps({
             "ok": True,
-            "path": str(fp.relative_to(WORKSPACE_ROOT)),
+            "path": str(fp.relative_to(utils.get_workspace_root())),
             "total_lines": len(lines),
             "start_line": start_line,
             "end_line": end_line,
@@ -1958,7 +2131,7 @@ def read_file_lines(path: str, start_line: int = 1, end_line: int = 100) -> str:
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
-
+@utils.timer
 @tool("walk_dir")
 def walk_dir(path: str = ".", max_depth: int = 3, max_files: int = 200) -> str:
     """遍历目录结构。
@@ -1985,7 +2158,7 @@ def walk_dir(path: str = ".", max_depth: int = 3, max_files: int = 200) -> str:
                 if file_count[0] >= max_files:
                     break
 
-                rel_path = str(item.relative_to(WORKSPACE_ROOT))
+                rel_path = str(item.relative_to(utils.get_workspace_root()))
                 is_dir = item.is_dir()
 
                 entry = {
@@ -2015,13 +2188,13 @@ def walk_dir(path: str = ".", max_depth: int = 3, max_files: int = 200) -> str:
 
     return json.dumps({
         "ok": True,
-        "root": str(root.relative_to(WORKSPACE_ROOT)),
+        "root": str(root.relative_to(utils.get_workspace_root())),
         "max_depth": max_depth,
         "total_items": len(result),
         "items": result
     }, ensure_ascii=False)
 
-
+@utils.timer
 @tool("get_dir_tree")
 def get_dir_tree(path: str = ".", max_depth: int = 5) -> str:
     """获取目录树结构（更简洁的树形展示）。
@@ -2055,7 +2228,7 @@ def get_dir_tree(path: str = ".", max_depth: int = 5) -> str:
                         "prefix": full_prefix,
                         "name": item.name + "/",
                         "type": "dir",
-                        "path": str(item.relative_to(WORKSPACE_ROOT))
+                        "path": str(item.relative_to(utils.get_workspace_root()))
                     })
                     new_prefix = prefix + ("    " if is_last_item else "│   ")
                     build_tree(item, new_prefix, is_last_item, depth + 1)
@@ -2067,14 +2240,14 @@ def get_dir_tree(path: str = ".", max_depth: int = 5) -> str:
                             "prefix": full_prefix,
                             "name": item.name + size_str,
                             "type": "file",
-                            "path": str(item.relative_to(WORKSPACE_ROOT))
+                            "path": str(item.relative_to(utils.get_workspace_root()))
                         })
                     except Exception:
                         tree.append({
                             "prefix": full_prefix,
                             "name": item.name,
                             "type": "file",
-                            "path": str(item.relative_to(WORKSPACE_ROOT))
+                            "path": str(item.relative_to(utils.get_workspace_root()))
                         })
 
         except PermissionError:
@@ -2084,7 +2257,7 @@ def get_dir_tree(path: str = ".", max_depth: int = 5) -> str:
 
     return json.dumps({
         "ok": True,
-        "root": str(root.relative_to(WORKSPACE_ROOT)),
+        "root": str(root.relative_to(utils.get_workspace_root())),
         "max_depth": max_depth,
         "total": len(tree),
         "tree": tree
@@ -2109,7 +2282,7 @@ def _truncate_text(s: str, limit: int = 20000) -> str:
 
 def _relpath_str(p: Path) -> str:
     try:
-        return str(p.relative_to(WORKSPACE_ROOT))
+        return str(p.relative_to(utils.get_workspace_root()))
     except Exception:
         return str(p)
 
@@ -2140,7 +2313,7 @@ def _find_first(root: Path, names: List[str], max_depth: int = 6) -> Path:
         pass
     return Path()
 
-
+@utils.timer
 @tool("repo_scan")
 def repo_scan(path: str = ".", max_files: int = 20000, max_depth: int = 4) -> str:
     """扫描代码仓库概况（模块边界、语言/文件分布、构建体系、关键文件存在性）。
@@ -2226,7 +2399,7 @@ def repo_scan(path: str = ".", max_files: int = 20000, max_depth: int = 4) -> st
         ]
     }, ensure_ascii=False)
 
-
+@utils.timer
 @tool("read_file_lines")
 def read_file_lines(path: str, start_line: int = 1, end_line: int = 200) -> str:
     """按行读取文件片段（包含行号），用于证据引用与精确定位。
@@ -2263,7 +2436,7 @@ def read_file_lines(path: str, start_line: int = 1, end_line: int = 200) -> str:
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
-
+@utils.timer
 @tool("rg_search")
 def rg_search(pattern: str, path: str = ".", glob: str = "", max_results: int = 200) -> str:
     """使用 ripgrep (rg) 搜索；若 rg 不可用则回退到 Python 扫描。
@@ -2345,7 +2518,7 @@ def rg_search(pattern: str, path: str = ".", glob: str = "", max_results: int = 
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
-
+@utils.timer
 @tool("ensure_compile_commands")
 def ensure_compile_commands(src_dir: str = ".", build_dir: str = "build", method: str = "auto") -> str:
     """确保 compile_commands.json 可用；若缺失则尝试生成（优先 CMake）。
@@ -2463,7 +2636,7 @@ def _file_uri(fp: Path) -> str:
     import urllib.parse
     return "file://" + urllib.parse.quote(str(fp.resolve()))
 
-
+@utils.timer
 @tool("clangd_lsp_query")
 def clangd_lsp_query(path: str, line: int, character: int, method: str = "definition",
                      compile_commands_dir: str = "build", timeout_sec: int = 20) -> str:
@@ -2514,7 +2687,7 @@ def clangd_lsp_query(path: str, line: int, character: int, method: str = "defini
             "method": "initialize",
             "params": {
                 "processId": None,
-                "rootUri": _file_uri(WORKSPACE_ROOT),
+                "rootUri": _file_uri(utils.get_workspace_root()),
                 "capabilities": {},
             }
         })
@@ -2618,7 +2791,7 @@ def clangd_lsp_query(path: str, line: int, character: int, method: str = "defini
         except Exception:
             pass
 
-
+@utils.timer
 @tool("build_cpp_project")
 def build_cpp_project(build_dir: str = "build", build_system: str = "auto", target: str = "", jobs: int = 8,
                       extra_args: str = "", timeout: int = 1800) -> str:
@@ -2632,7 +2805,7 @@ def build_cpp_project(build_dir: str = "build", build_system: str = "auto", targ
         extra_args: 额外参数字符串（原样拼接）
         timeout: 超时（秒）
     """
-    root = WORKSPACE_ROOT
+    root = utils.get_workspace_root()
     sys_guess = _detect_build_system(root)
     if build_system == "auto":
         build_system = sys_guess
@@ -2684,7 +2857,7 @@ def build_cpp_project(build_dir: str = "build", build_system: str = "auto", targ
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
-
+@utils.timer
 @tool("run_cpp_tests")
 def run_cpp_tests(build_dir: str = "build", test_system: str = "auto", target: str = "", jobs: int = 8,
                   extra_args: str = "", timeout: int = 1800) -> str:
@@ -2698,7 +2871,7 @@ def run_cpp_tests(build_dir: str = "build", test_system: str = "auto", target: s
         extra_args: 额外参数字符串
         timeout: 超时
     """
-    root = WORKSPACE_ROOT
+    root = utils.get_workspace_root()
     sys_guess = _detect_build_system(root)
 
     if test_system == "auto":
@@ -2739,7 +2912,7 @@ def run_cpp_tests(build_dir: str = "build", test_system: str = "auto", target: s
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
-
+@utils.timer
 @tool("run_clang_tidy_project")
 def run_clang_tidy_project(path: str = ".", build_dir: str = "build", checks: str = "", jobs: int = 8,
                            header_filter: str = "", extra_args: str = "", timeout: int = 1800) -> str:
@@ -2778,7 +2951,7 @@ def run_clang_tidy_project(path: str = ".", build_dir: str = "build", checks: st
                 cmd.append(f"-header-filter={header_filter}")
             if extra_args:
                 cmd += extra_args.split()
-            res = subprocess.run(cmd, cwd=str(WORKSPACE_ROOT), capture_output=True, text=True, timeout=timeout)
+            res = subprocess.run(cmd, cwd=str(utils.get_workspace_root()), capture_output=True, text=True, timeout=timeout)
             return json.dumps({
                 "ok": res.returncode == 0,
                 "engine": "run-clang-tidy",
@@ -2805,7 +2978,7 @@ def run_clang_tidy_project(path: str = ".", build_dir: str = "build", checks: st
                 cmd += [f"-header-filter={header_filter}"]
             if extra_args:
                 cmd += extra_args.split()
-            res = subprocess.run(cmd, cwd=str(WORKSPACE_ROOT), capture_output=True, text=True, timeout=120)
+            res = subprocess.run(cmd, cwd=str(utils.get_workspace_root()), capture_output=True, text=True, timeout=120)
             outputs.append({
                 "file": _relpath_str(fp),
                 "returncode": res.returncode,
@@ -2826,7 +2999,7 @@ def run_clang_tidy_project(path: str = ".", build_dir: str = "build", checks: st
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
-
+@utils.timer
 @tool("apply_unified_diff")
 def apply_unified_diff(diff: str, check_only: bool = False) -> str:
     """应用 unified diff（优先 git apply；否则 fallback patch）。
@@ -2842,12 +3015,12 @@ def apply_unified_diff(diff: str, check_only: bool = False) -> str:
     patch_bin = shutil.which("patch")
 
     try:
-        if git and (WORKSPACE_ROOT / ".git").exists():
+        if git and (utils.get_workspace_root() / ".git").exists():
             # write temp patch
-            tmp = WORKSPACE_ROOT / ".tmp_llm_patch.diff"
+            tmp = utils.get_workspace_root() / ".tmp_llm_patch.diff"
             tmp.write_text(diff, encoding="utf-8")
             cmd_check = ["git", "apply", "--check", str(tmp)]
-            ck = subprocess.run(cmd_check, cwd=str(WORKSPACE_ROOT), capture_output=True, text=True, timeout=60)
+            ck = subprocess.run(cmd_check, cwd=str(utils.get_workspace_root()), capture_output=True, text=True, timeout=60)
             if ck.returncode != 0:
                 return json.dumps({
                     "ok": False,
@@ -2860,7 +3033,7 @@ def apply_unified_diff(diff: str, check_only: bool = False) -> str:
                 return json.dumps({"ok": True, "checked": True, "applied": False}, ensure_ascii=False)
 
             cmd_apply = ["git", "apply", str(tmp)]
-            ap = subprocess.run(cmd_apply, cwd=str(WORKSPACE_ROOT), capture_output=True, text=True, timeout=60)
+            ap = subprocess.run(cmd_apply, cwd=str(utils.get_workspace_root()), capture_output=True, text=True, timeout=60)
             if ap.returncode != 0:
                 return json.dumps({
                     "ok": False,
@@ -2875,12 +3048,12 @@ def apply_unified_diff(diff: str, check_only: bool = False) -> str:
             return json.dumps({"ok": False, "error": "无 git 仓库且 patch 不可用，无法应用 diff"}, ensure_ascii=False)
 
         # patch fallback
-        tmp = WORKSPACE_ROOT / ".tmp_llm_patch.diff"
+        tmp = utils.get_workspace_root() / ".tmp_llm_patch.diff"
         tmp.write_text(diff, encoding="utf-8")
         cmd = ["patch", "-p0", "-i", str(tmp)]
         if check_only:
             cmd.insert(1, "--dry-run")
-        res = subprocess.run(cmd, cwd=str(WORKSPACE_ROOT), capture_output=True, text=True, timeout=60)
+        res = subprocess.run(cmd, cwd=str(utils.get_workspace_root()), capture_output=True, text=True, timeout=60)
         return json.dumps({
             "ok": res.returncode == 0,
             "engine": "patch",
@@ -2895,7 +3068,7 @@ def apply_unified_diff(diff: str, check_only: bool = False) -> str:
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
-
+@utils.timer
 @tool("patch_apply_and_verify")
 def patch_apply_and_verify(diff: str, format_changed: bool = True, build: bool = False, test: bool = False,
                            build_dir: str = "build") -> str:
@@ -2953,10 +3126,9 @@ def patch_apply_and_verify(diff: str, format_changed: bool = True, build: bool =
         "test": test_res
     }, ensure_ascii=False)
 
-
 TOOLS = [
     # 基础工具
-    read_text_file,
+    read_file,
     list_dir,
     grep_text,
     web_search,
@@ -2985,7 +3157,7 @@ TOOLS = [
     # 通用源码工具
     read_source_file,
     list_source_files,
-    batch_read_source_files,
+    # batch_read_source_files,
     grep_source_code,
     get_source_metrics,
     # C/C++ 专用工具
@@ -3005,5 +3177,9 @@ TOOLS = [
     run_clang_tidy_project,
     apply_unified_diff,
     patch_apply_and_verify,
+    # git 工具
+    git_status,
+    git_diff,
+    git_show,
 ]
 TOOL_REGISTRY = build_tool_registry(TOOLS)

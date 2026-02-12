@@ -23,7 +23,6 @@ from pydantic_ai import Agent
 from pydantic_ai.models import ModelSettings
 
 import utils
-from skills_registry import with_skill_catalog
 
 try:
     from pydantic_ai.models.openai import OpenAIChatModel
@@ -70,13 +69,12 @@ from internal_prompt import (
     PLAN_REVIEW_SYSTEM,
     AGENT_SYSTEMS,
     AGENT_RETRY_INSTRUCTION,
-    TIME_FALLBACK_CONTENT,
-    get_plan_system_prompt,
-    get_reflect_system_prompt,
-    get_response_prompt,
+    TIME_FALLBACK_CONTENT, PLAN_SYSTEM, RESPOND_SYSTEM, REFLECT_SYSTEM,
 )
 from tools import TOOL_REGISTRY
 from web_tools import web_search, web_open, http_get
+from pydantic import BaseModel, Field
+from skills_registry import REGISTRY as SKILL_REGISTRY
 from mcp_adapter import CLIENT_MANAGER, update_global_registry
 from utils import (
     normalize_provider,
@@ -88,7 +86,6 @@ from utils import (
     extract_text_content,
     try_parse_json,
     to_dict,
-    tail_messages_tool_safe,
     ai_meta,
     tool_calls_signature,
     text_hash,
@@ -185,12 +182,13 @@ def has_orphan_tool_message(msgs: list[BaseMessage]) -> bool:
             return True
     return False
 
-
+@utils.timer
 async def async_invoke_structured_with_retry(
     llm, msgs, *, role="unknown", retries=3, base_sleep=0.5
 ):
     attempt = 0
 
+    @utils.timer
     @retry_with_backoff(retries=retries, base_sleep=base_sleep)
     async def _invoke_once():
         nonlocal attempt
@@ -227,23 +225,19 @@ async def async_invoke_structured_with_retry(
             )
 
         msgs_with_time = utils.filter_messages_for_llm(msgs_with_time)
+        start = time.perf_counter()
         answer = await llm.ainvoke(msgs_with_time)
+        end = time.perf_counter()
+        logger.info(f"{__name__} 耗时: {end - start:.6f} 秒")
 
         # 建议：把这段打印放到开关里，否则会非常吵
         if env("AGENT_LOG_LLM_DUMP", "0") == "1":
             try:
-                # 1. 转换 answer 为字典
-                # print_data = utils.to_dumpable(answer)
-
-                # 2. 【优化】打印问题 (msgs)
-                # 不要直接 print(list)，先转成字典列表再用 json dump，才能看到中文
                 msgs_data = [utils.to_dumpable(m) for m in msgs_with_time]
-                print(f"--------- Question: ---------")
+                print(f"--------- {role} Question: ---------")
                 print(json.dumps(msgs_data, ensure_ascii=False, indent=2, default=str))
 
-                # 3. 【优化】打印结果 (answer)
-                # 这一行您写的是对的，它会输出中文
-                print(f"--------- Answer: ---------")
+                print(f"--------- {role} Answer 耗时: {end - start:.6f} 秒: ---------")
                 print(json.dumps(answer, ensure_ascii=False, indent=2, default=str))
             except Exception:
                 pass
@@ -493,6 +487,8 @@ async def async_invoke_structured_with_retry(
                     ],
                     "plan_patch": {"version": 1, "objective": "", "steps": []},
                 }
+            elif role == "skill_router":
+                parsed = {"selected_skill_ids": []}
             else:
                 parsed = {"error": "无法解析模型输出", "raw": raw_text}
 
@@ -518,7 +514,6 @@ async def async_invoke_structured_with_retry(
         return answer
 
     return await _invoke_once()
-
 
 def mk_chat_ollama(
     *,
@@ -665,7 +660,7 @@ def mk_role_chat(role: str) -> BaseChatModel:
         raise RuntimeError(f"Model {key_model} not found.")
     if base_url is None or base_url == "":
         raise RuntimeError(f"Base URL {key_base_url} not found.")
-    if api_key is None or api_key == "":
+    if provider.upper() != "OLLAMA" and (api_key is None or api_key == ""):
         raise RuntimeError(f"API key {key_api_key} not found.")
 
     # NOTE:
@@ -819,7 +814,7 @@ def with_structured(llm: Runnable, schema_model: Any) -> Runnable:
         except Exception:
             return llm.with_structured_output(schema_model, include_raw=True)
 
-
+@utils.timer
 async def tool_invoke(tool_obj: Any, args: Dict[str, Any]) -> Any:
     """兼容各种 LangChain 工具对象的调用方式"""
     logger.debug(
@@ -859,28 +854,39 @@ async def tool_invoke(tool_obj: Any, args: Dict[str, Any]) -> Any:
 
     raise TypeError(f"Tool {tool_obj!r} is not invokable.")
 
-
+@utils.timer
 async def safe_tool_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Execute tool_calls from the last AIMessage, but truncate tool output aggressively
-    so it won't explode token usage in the next agent turn.
-    """
     msgs = state.get("messages", [])
     if not msgs:
-        return {"messages": []}
+        return {}
 
     last_msg = msgs[-1]
-    tool_calls = extract_tool_calls(last_msg)
+    tool_calls = extract_tool_calls(last_msg) or []
     if not tool_calls:
-        return {"messages": []}
+        return {}
+
+    # === 关键：限制每轮执行的 tool_call 数量（默认 1）===
+    max_calls = int(env("MAX_TOOL_CALLS_PER_TURN", "1"))
+    tool_calls = tool_calls[:max(1, max_calls)]
 
     new_msgs: List[BaseMessage] = []
-    for call in tool_calls:
-        call_id = call.get("id")
-        name = str(call.get("name") or "")
-        args = call.get("args") or {}
+    for idx, call in enumerate(tool_calls):
+        name = str(call.get("name") or "").strip()
+        call_id = str(call.get("id") or f"call_{name}_{idx}")
 
-        tool = TOOL_REGISTRY.get(name) or TOOL_REGISTRY.get(name.strip().lower())
+        # args 兼容：dict 或 json string
+        raw_args = call.get("args")
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args)
+            except Exception:
+                args = {"_raw": raw_args}
+        elif isinstance(raw_args, dict):
+            args = raw_args
+        else:
+            args = {}
+
+        tool = TOOL_REGISTRY.get(name) or TOOL_REGISTRY.get(name.lower())
         if not tool:
             content = tool_result_to_text({
                 "error": "tool_not_found",
@@ -900,15 +906,16 @@ async def safe_tool_node(state: AgentState) -> Dict[str, Any]:
                 "exception": f"{type(e).__name__}: {e}",
             })
 
-        # 建议：把这段打印放到开关里，否则会非常吵
         if env("AGENT_LOG_LLM_DUMP", "0") == "1":
             try:
-                print(f"--------- tool call: ---------")
-                print(json.dumps(tool, ensure_ascii=False, indent=2, default=str))
-                print(f"--------- tool args: ---------")
+                print("--------- tool call ---------")
+                print(f"name={name} call_id={call_id}")
+                print("--------- tool args ---------")
                 print(json.dumps(args, ensure_ascii=False, indent=2, default=str))
-                print(f"--------- tool result: ---------")
-                print(json.dumps(content, ensure_ascii=False, indent=2, default=str))
+                print("--------- tool result ---------")
+                # 结果也建议预览，避免控制台爆
+                preview = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False, default=str)
+                print(preview[:2000])
             except Exception:
                 pass
 
@@ -963,7 +970,7 @@ def build_llm():
 
     return intent_llm, planner_llm, agent_base, reflector_llm, responder_llm
 
-
+@utils.timer
 async def intent_node(state, intent_llm):
     user_req = state["user_request"]
 
@@ -1013,7 +1020,7 @@ async def intent_node(state, intent_llm):
         }],
     }
 
-
+@utils.timer
 async def initial_plan_node(state: AgentState, llm) -> Dict[str, Any]:
     user_req = state["user_request"]
 
@@ -1046,7 +1053,7 @@ async def initial_plan_node(state: AgentState, llm) -> Dict[str, Any]:
     )
 
     msgs = [
-        SystemMessage(content=get_plan_system_prompt("initial_plan")),
+        SystemMessage(content=INTENT_SYSTEM),
         utils.runtime_clock_msg(),
         SystemMessage(content=f"已完成意图分析（JSON）：{intent_json}"),
         HumanMessage(content=f"用户需求：{user_req}{feedback_msg}\n请生成前2-3个关键步骤，后续步骤将在执行中动态生成。"),
@@ -1151,7 +1158,7 @@ async def initial_plan_node(state: AgentState, llm) -> Dict[str, Any]:
         ],
     }
 
-
+@utils.timer
 async def dynamic_plan_node(state: AgentState, llm) -> Dict[str, Any]:
     user_req = state["user_request"]
 
@@ -1194,7 +1201,7 @@ async def dynamic_plan_node(state: AgentState, llm) -> Dict[str, Any]:
             })
 
     msgs = [
-        SystemMessage(content=get_plan_system_prompt("dynamic_plan")),
+        SystemMessage(content=PLAN_SYSTEM),
         utils.runtime_clock_msg(),
         SystemMessage(content=f"用户目标：{user_req}{feedback_msg}"),
         SystemMessage(content=f"已完成步骤：{executed_steps}"),
@@ -1315,6 +1322,7 @@ async def dynamic_plan_node(state: AgentState, llm) -> Dict[str, Any]:
         ],
     }
 
+@utils.timer
 async def plan_reviewer_node(state: AgentState, llm) -> Dict[str, Any]:
     plan = state.get("plan")
     user_req = state.get("user_request")
@@ -1370,17 +1378,124 @@ async def plan_reviewer_node(state: AgentState, llm) -> Dict[str, Any]:
         
     return updates
 
+# ===== Skills injection (B + optional C) =====
+# B: System-side retrieval of top-k skill cards relevant to the current task and compatible with the role toolset.
+# C: Optional LLM selection (router) to choose a small subset of skills and inline their full docs/excerpts.
+
+SKILL_CARD_TOPK = int(os.getenv("SKILL_CARD_TOPK", "8") or 8)
+SKILL_SELECT_TOPK = int(os.getenv("SKILL_SELECT_TOPK", "2") or 2)  # keep small to control token cost
+SKILL_CONTEXT_MAX_CHARS = int(os.getenv("SKILL_CONTEXT_MAX_CHARS", "12000") or 12000)
+SKILL_SELECT_MODE = str(os.getenv("SKILL_SELECT_MODE", "b+c") or "b+c").lower()
+# Modes:
+# - "off": disable skills injection
+# - "b": inject only skill cards (摘要)
+# - "b+c": inject cards and use an LLM router to inline a few full skill docs
+# - "heuristic": same as "b" but deterministically pick top-N skills without LLM routing
+# Default is "b+c".
+class SkillSelectModel(BaseModel):
+    selected_skill_ids: List[str] = Field(default_factory=list, description="Select up to SKILL_SELECT_TOPK skill ids from the provided candidates.")
+
+_SKILL_SELECT_LLM = None
+
+def _get_skill_select_llm():
+    global _SKILL_SELECT_LLM
+    if _SKILL_SELECT_LLM is None:
+        # Use a tool-free model; structured output ensures we get a parseable list.
+        _SKILL_SELECT_LLM = with_structured(mk_role_chat("planner"), SkillSelectModel)
+    return _SKILL_SELECT_LLM
+
+def _tool_names(role_tools: Optional[List[Any]]) -> List[str]:
+    if not role_tools:
+        return []
+    names: List[str] = []
+    for t in role_tools:
+        n = getattr(t, "name", None) or getattr(t, "__name__", None) or str(t)
+        n = str(n).strip()
+        if n:
+            names.append(n)
+    return names
+
+async def _build_skill_injection(role: str, role_tools: Optional[List[Any]], query_text: str) -> str:
+    if SKILL_SELECT_MODE in ("off", "0", "false", "none"):
+        return ""
+    toolset = set(_tool_names(role_tools))
+    if not toolset:
+        return ""
+    cards = SKILL_REGISTRY.search_cards(query_text or "", toolset=toolset, top_k=SKILL_CARD_TOPK)
+    if not cards:
+        return ""
+    cards_text = SKILL_REGISTRY.render_cards(cards, max_items=SKILL_CARD_TOPK)
+
+    mode = SKILL_SELECT_MODE
+    if mode in ("b", "cards"):
+        return cards_text
+
+    # Deterministic top-N selection (no extra LLM call)
+    if mode in ("heuristic", "topn"):
+        selected = [m.skill_id for m in cards[:max(1, SKILL_SELECT_TOPK)]]
+        docs_text = SKILL_REGISTRY.render_full_docs(selected, max_chars_total=SKILL_CONTEXT_MAX_CHARS)
+        return cards_text + "\n\n" + docs_text if docs_text else cards_text
+
+    # LLM routing selection (C)
+    if "c" not in mode:
+        return cards_text
+
+    selector = _get_skill_select_llm()  # 已经绑定 SkillSelectModel
+    cand_ids = [m.skill_id for m in cards]
+    select_msgs: List[BaseMessage] = [
+        SystemMessage(content=(
+            "You are a skill router.\n"
+            f"Select up to {SKILL_SELECT_TOPK} skill ids that are most relevant to the user's request + current step.\n"
+            "Rules:\n"
+            "- Only choose from the provided candidate ids.\n"
+            "- Prefer fewer skills; choose none if none are clearly relevant.\n"
+            "- Do not output anything except the structured fields."
+        )),
+        HumanMessage(content=(
+            f"User/Step Query:\n{query_text}\n\n"
+            f"Candidate Skill Cards (ids): {', '.join(cand_ids)}\n\n"
+            f"{cards_text}"
+        )),
+    ]
+    ans = await async_invoke_structured_with_retry(
+        selector,
+        select_msgs,
+        role = role,
+        retries = 2,
+        base_sleep = 0.3,
+    )
+
+    raw = getattr(ans, "selected_skill_ids", None)
+    if raw is None and isinstance(ans, dict):
+        raw = ans.get("selected_skill_ids")
+    selected_ids: List[str] = []
+    for x in (raw or []):
+        sid = str(x).strip()
+        if sid and sid in cand_ids and sid not in selected_ids:
+            selected_ids.append(sid)
+        if len(selected_ids) >= max(1, SKILL_SELECT_TOPK):
+            break
+
+    if not selected_ids:
+        return cards_text
+
+    docs_text = SKILL_REGISTRY.render_full_docs(selected_ids, max_chars_total=SKILL_CONTEXT_MAX_CHARS)
+    return cards_text + "\n\n" + docs_text if docs_text else cards_text
+
+# ===== End Skills injection =====
+
 def _tool_allowed_roles() -> set[str]:
     # 只给“会执行任务/会调用工具”的角色注入 skills catalog
     # planner/router/reflector 通常不注入以省 token
     return {"solver", "code_researcher", "code_reviewer"}
 
-def agent_node(role: str, llm: BaseChatModel):
+@utils.timer
+def agent_node(role: str, llm: BaseChatModel, role_tools: Optional[List[Any]] = None):
     """
     Step executor (Scheme B). Tools are executed only by ToolNode.
     Token-optimized: only feed step-local messages + required dependency artifacts.
     """
-
+    @utils.timer
     async def _node(state: AgentState) -> Dict[str, Any]:
         step_idx = int(state.get("step_idx", 0) or 0)
         step = current_step(state) or {"id": f"step{step_idx+1}", "task": "No task", "acceptance": ""}
@@ -1444,9 +1559,20 @@ def agent_node(role: str, llm: BaseChatModel):
                 f"{fb_text}"
             )
 
+        # Skills injection: inject role-compatible, query-relevant skill cards (and optionally inline a few full docs).
+        if (not returning_from_tools) and (role in _tool_allowed_roles()):
+            query_text = "\n".join([x for x in [
+                str(state.get("user_request") or ""),
+                str(plan.get("objective") or ""),
+                str(step.get("task") or ""),
+                str(step.get("acceptance") or ""),
+            ] if x.strip()])
+            skill_ctx = await _build_skill_injection("skill_router", role_tools, query_text)
+            if skill_ctx.strip():
+                msgs.append(SystemMessage(content=skill_ctx))
+
         msgs.append(HumanMessage(content=user_prompt))
 
-        t0 = time.time()
         try:
             resp = await async_invoke_chat_with_retry(llm, msgs, role=role, retries=2)
         except Exception as e:
@@ -1510,6 +1636,7 @@ def agent_node(role: str, llm: BaseChatModel):
 
     return _node
 
+@utils.timer
 async def respond_node(state: AgentState, responder_llm: BaseChatModel):
     plan = state.get("plan") or {}
     steps = plan.get("steps") or []
@@ -1529,7 +1656,7 @@ async def respond_node(state: AgentState, responder_llm: BaseChatModel):
         )
 
     msgs = [
-        SystemMessage(content=get_response_prompt("response") + "\n\n【硬性约束】禁止调用工具；直接输出最终答复文本。"),
+        SystemMessage(content=RESPOND_SYSTEM + "\n\n【硬性约束】禁止调用工具；直接输出最终答复文本。"),
         HumanMessage(content=(
             f"用户原始请求：{user_request}\n\n"
             f"请基于以下步骤产出合并最终答复：\n" + "\n".join(results) +
@@ -1549,6 +1676,7 @@ async def respond_node(state: AgentState, responder_llm: BaseChatModel):
         }],
     }
 
+@utils.timer
 async def route_node(state: AgentState) -> Dict[str, Any]:
     plan = state.get("plan") or {}
     steps = plan.get("steps") or []
@@ -1579,7 +1707,7 @@ async def route_node(state: AgentState) -> Dict[str, Any]:
         ],
     }
 
-
+@utils.timer
 async def reflect_node(state: AgentState, llm) -> Dict[str, Any]:
     step = current_step(state) or {}
     step_id = state.get("last_step_id") or step.get("id", "step0")
@@ -1621,7 +1749,7 @@ async def reflect_node(state: AgentState, llm) -> Dict[str, Any]:
 
     previous_reflections = list(state.get("reflections", []) or [])
     msgs = [
-        SystemMessage(content=get_reflect_system_prompt("reflect")),
+        SystemMessage(content=REFLECT_SYSTEM),
         utils.runtime_clock_msg(),
         HumanMessage(content=json.dumps({
             "objective": (state.get("plan") or {}).get("objective", state.get("user_request", "")),
@@ -1731,7 +1859,7 @@ async def reflect_node(state: AgentState, llm) -> Dict[str, Any]:
     updates["step_idx"] = idx + 1
     return updates
 
-
+@utils.timer
 def route_after_plan_review(state: AgentState) -> str:
     nxt = state.get("next_node")
     if nxt == "dynamic_plan":
@@ -1740,7 +1868,7 @@ def route_after_plan_review(state: AgentState) -> str:
         return "initial_plan"
     return "route"
 
-
+@utils.timer
 def route_after_route(state: AgentState) -> str:
     if state.get("done"):
         return "respond"
@@ -1773,6 +1901,7 @@ def route_after_initial_plan(state: AgentState) -> str:
 def route_after_dynamic_plan(state: AgentState) -> str:
     return "route"
 
+@utils.timer
 def route_after_agent(state: AgentState) -> str:
     msgs = state.get("messages") or []
 
@@ -1783,7 +1912,7 @@ def route_after_agent(state: AgentState) -> str:
         return "tools"
     return "reflect"
 
-
+@utils.timer
 def route_after_tools(state: AgentState) -> str:
     role = state.get("last_agent_role", "writer")
 
@@ -1831,7 +1960,7 @@ def route_after_tools(state: AgentState) -> str:
 
     return role
 
-
+@utils.timer
 def route_after_reflect(state: AgentState) -> str:
     if state.get("done"):
         return "respond"
@@ -1891,7 +2020,7 @@ def build_reflection_multi_agent_graph(
         else:
             bound_llm = agent_base
             
-        return agent_node(role, bound_llm)
+        return agent_node(role, bound_llm, tools)
 
     async def _reflect(s: AgentState) -> Dict[str, Any]:
         return await reflect_node(s, reflector_llm)

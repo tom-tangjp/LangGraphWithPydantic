@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import time
 from typing import Literal, Dict, Any, List, Annotated, Optional
 from typing_extensions import TypedDict
 from langchain_core.messages import AnyMessage, BaseMessage, AIMessage, ToolMessage
@@ -236,7 +237,7 @@ def current_step(state: AgentState) -> AgentStep:
         return steps[idx]
     return {}
 
-
+@utils.timer
 async def async_invoke_chat_with_retry(
     llm, msgs, *, role="unknown", retries=2, base_sleep=0.5
 ) -> AIMessage:
@@ -254,6 +255,7 @@ async def async_invoke_chat_with_retry(
     ):
         _OllamaResponseError = Exception
 
+    @utils.timer
     @retry_with_backoff(retries=retries, base_sleep=base_sleep)
     async def _invoke_once() -> AIMessage:
         _log_event("llm.chat.call", try_i=0, role=role, msgs=msg_preview(msgs))
@@ -278,23 +280,19 @@ async def async_invoke_chat_with_retry(
             )
 
         msgs_with_time = utils.filter_messages_for_llm(msgs_with_time)
+        start = time.perf_counter()
         resp = await llm.ainvoke(msgs_with_time)
+        end = time.perf_counter()
+        logger.info(f"{__name__} 耗时: {end - start:.6f} 秒")
 
         # 建议：把这段打印放到开关里，否则会非常吵
         if env("AGENT_LOG_LLM_DUMP", "0") == "1":
             try:
-                # 1. 转换 answer 为字典
-                # print_data = to_dumpable(resp)
-
-                # 2. 【优化】打印问题 (msgs)
-                # 不要直接 print(list)，先转成字典列表再用 json dump，才能看到中文
                 msgs_data = [to_dumpable(m) for m in msgs]
-                print(f"--------- Question: ---------")
+                print(f"--------- {role} Question: ---------")
                 print(json.dumps(msgs_data, ensure_ascii=False, indent=2, default=str))
 
-                # 3. 【优化】打印结果 (answer)
-                # 这一行您写的是对的，它会输出中文
-                print(f"--------- Answer: ---------")
+                print(f"--------- {role} Answer 耗时:{end - start:.6f} 秒: ---------")
                 print(json.dumps(resp, ensure_ascii=False, indent=2, default=str))
             except Exception:
                 pass

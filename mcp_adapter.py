@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 import json
 import logging
@@ -50,7 +51,7 @@ class MCPClientManager:
         server_params = StdioServerParameters(
             command=sys.executable,
             args=[script_name],
-            env=None 
+            env=os.environ.copy() # type: ignore[arg-type]
         )
 
         # Use AsyncExitStack to manage lifecycles safely

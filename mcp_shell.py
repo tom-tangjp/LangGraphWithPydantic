@@ -14,6 +14,8 @@ from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
 
+import utils
+
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 logger = logging.getLogger("mcp_shell")
 
@@ -48,6 +50,8 @@ def _prefix_allowed(cmd: str) -> bool:
         return True
     s = (cmd or "").lstrip()
     return any(s.startswith(p) for p in _PREFIXES)
+
+@utils.timer
 @mcp.tool()
 def run_bash(
     command: str, timeout: int = 60, work_dir: str = "."

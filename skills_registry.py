@@ -1,333 +1,399 @@
 # skills_registry.py
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List, Any
 
+import yaml
 from langchain_core.tools import tool
 
 import utils
-from const import TRUNCATE_LOG_LEN, DEFAULT_ROOT
+from const import TRUNCATE_LOG_LEN
 
 logger = logging.getLogger(__name__)
 
+_MD_CANDIDATES = ("SKILL.md", "skill.md", "README.md")
 
-@dataclass(frozen=True)
+@dataclass
 class SkillMeta:
-    name: str
-    path: Path
-    one_liner: str
+    """Best-effort parsed metadata for a skill.
+
+    Notes:
+    - No rigid file format is required. Metadata extraction is best-effort.
+    - If allowed_tools is empty, it means "unknown/unspecified" (not "no tools").
+    """
+
+    skill_id: str
+    source: str  # e.g. 'local', 'external'
+    path: Optional[Path] = None
+
+    display_name: str = ""
+    one_liner: str = ""
+    description: str = ""
+    triggers: List[str] = field(default_factory=list)
+
+    allowed_tools: List[str] = field(default_factory=list)
+    allowed_tools_explicit: bool = False  # whether allowed_tools was explicitly found
+
+    doc_chars: int = 0
+
+def _safe_read_text(p: Path, max_chars: int = 400_000) -> str:
+    try:
+        txt = p.read_text(encoding="utf-8", errors="ignore")
+        return txt[:max_chars]
+    except Exception as e:
+        logger.warning("failed to read %s: %s", str(p), e)
+        return ""
+
+
+def _split_front_matter(md: str) -> Tuple[Optional[str], str]:
+    """Return (front_matter_yaml_text_or_none, body)."""
+    s = md.lstrip()
+    if not s.startswith("---"):
+        return None, md
+    # Find closing '---' on its own line.
+    m = re.search(r"\n---\s*\n", s)
+    if not m:
+        return None, md
+    start = s.find("---") + 3
+    front = s[start:m.start()].strip("\r\n ")
+    body = s[m.end():]
+    return front, body
+
+def _yaml_to_dict(front: str) -> Dict[str, Any]:
+    if not front.strip():
+        return {}
+    if yaml is None:
+        out: Dict[str, Any] = {}
+        for line in front.splitlines():
+            if ":" not in line:
+                continue
+            k, v = line.split(":", 1)
+            out[k.strip()] = v.strip()
+        return out
+    try:
+        obj = yaml.safe_load(front)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+def _norm_key(k: str) -> str:
+    return re.sub(r"[_\s]+", "-", (k or "").strip().lower())
+
+def _as_list(v: Any) -> List[str]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    s = str(v).strip()
+    if not s:
+        return []
+    parts = re.split(r"[\s,;]+", s)
+    return [p for p in (x.strip() for x in parts) if p]
+
+def _extract_heading_name(md: str) -> str:
+    # '# SKILL: xxx' or '# Skill: xxx'
+    m = re.search(r"^#\s*SKILL\s*[:：]\s*(.+?)\s*$", md, flags=re.IGNORECASE | re.MULTILINE)
+    if m:
+        return m.group(1).strip()
+    # YAML-like 'name: xxx' near the top (first 60 lines)
+    head = "\n".join(md.splitlines()[:60])
+    m = re.search(r"^name\s*:\s*(.+?)\s*$", head, flags=re.IGNORECASE | re.MULTILINE)
+    if m:
+        return m.group(1).strip()
+    # First H1
+    m = re.search(r"^#\s+(.+?)\s*$", md, flags=re.MULTILINE)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+def _extract_one_liner(md: str) -> str:
+    m = re.search(
+        r"^##\s+One-Sentence\s+Summary\s*\n(.+?)(?:\n\n|\n#|\n##)",
+        md,
+        flags=re.IGNORECASE | re.DOTALL | re.MULTILINE,
+    )
+    if m:
+        line = m.group(1).strip().splitlines()[0].strip()
+        return line[:300]
+    lines = [ln.strip() for ln in md.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    while lines and lines[0].startswith("#"):
+        lines.pop(0)
+    if not lines:
+        return ""
+    return lines[0][:300]
+
+def _parse_meta(md: str, fallback_id: str) -> SkillMeta:
+    front, _ = _split_front_matter(md)
+    front_obj: Dict[str, Any] = _yaml_to_dict(front or "")
+
+    norm: Dict[str, Any] = {}
+    for k, v in front_obj.items():
+        norm[_norm_key(str(k))] = v
+
+    name = str(norm.get("name") or norm.get("skill") or "").strip()
+    if not name:
+        name = _extract_heading_name(md).strip()
+
+    description = str(norm.get("description") or "").strip()
+    one_liner = str(norm.get("one-liner") or norm.get("one-liner-summary") or "").strip()
+    if not one_liner:
+        one_liner = _extract_one_liner(md)
+
+    triggers = _as_list(norm.get("triggers") or norm.get("trigger") or norm.get("keywords"))
+    if not triggers:
+        head = "\n".join(md.splitlines()[:120])
+        m = re.search(r"^Triggers\s*:\s*(.+?)\s*$", head, flags=re.IGNORECASE | re.MULTILINE)
+        if m:
+            triggers = _as_list(m.group(1))
+
+    allowed_raw = norm.get("allowed-tools") or norm.get("allowed_tools") or norm.get("allowedtool") or norm.get("allowed")
+    allowed_tools = _as_list(allowed_raw)
+    allowed_explicit = bool(allowed_tools)
+    if not allowed_tools:
+        head = "\n".join(md.splitlines()[:120])
+        m = re.search(r"^allowed[-_ ]?tools\s*:\s*(.+?)\s*$", head, flags=re.IGNORECASE | re.MULTILINE)
+        if m:
+            allowed_tools = _as_list(m.group(1))
+            allowed_explicit = bool(allowed_tools)
+
+    return SkillMeta(
+        skill_id=fallback_id,
+        source="local",
+        display_name=name or fallback_id,
+        one_liner=one_liner,
+        description=description,
+        triggers=triggers,
+        allowed_tools=allowed_tools,
+        allowed_tools_explicit=allowed_explicit,
+        doc_chars=len(md),
+    )
+
+def _pick_doc_path(skill_dir: Path) -> Optional[Path]:
+    for fn in _MD_CANDIDATES:
+        p = skill_dir / fn
+        if p.exists() and p.is_file():
+            return p
+    mds = sorted([p for p in skill_dir.glob("*.md") if p.is_file()])
+    return mds[0] if mds else None
 
 
 class SkillRegistry:
-    """
-    扫描 ./skills/<name>/SKILL.md
-    - 启动时 scan() 生成技能目录（name + one_liner）
-    - 运行时 load(name) 按需加载全文
-    """
-
-    def __init__(self, skills_dir: Path, *, max_chars: int = 50_000):
-        self.skills_dir = skills_dir.resolve()
-        self.max_chars = max_chars
+    def __init__(self) -> None:
         self._skills: Dict[str, SkillMeta] = {}
-        self._cache: Dict[str, str] = {}
-        self._last_scan_ts = 0.0
-        self._last_dir_mtime = 0.0
+        self._cache_text: Dict[str, str] = {}
 
-    def _dir_mtime(self) -> float:
-        try:
-            return self.skills_dir.stat().st_mtime
-        except Exception:
-            return 0.0
-
-    def maybe_rescan(self, ttl_s: float = 2.0) -> None:
-        now = time.time()
-        if now - self._last_scan_ts < ttl_s:
-            return
-        self._last_scan_ts = now
-
-        cur_mtime = self._dir_mtime()
-        if cur_mtime != self._last_dir_mtime:
-            self._last_dir_mtime = cur_mtime
-            self.scan()
-
-    def scan(self) -> Dict[str, SkillMeta]:
+    @utils.timer
+    def scan_skills(self) -> int:
         self._skills.clear()
-        self._cache.clear()
+        self._cache_text.clear()
 
-        if not self.skills_dir.exists():
-            return self._skills
-
-        for skill_dir in sorted(self.skills_dir.iterdir()):
-            if not skill_dir.is_dir():
+        skills_dir = utils.get_skills_dir()
+        for d in sorted([p for p in skills_dir.iterdir() if p.is_dir()]):
+            doc_path = _pick_doc_path(d)
+            if not doc_path:
                 continue
-            fp = skill_dir / "SKILL.md"
-            if not fp.exists():
+            md = _safe_read_text(doc_path)
+            if not md.strip():
                 continue
 
-            name = skill_dir.name
-            text = fp.read_text(encoding="utf-8", errors="ignore")
-            one_liner = self._extract_one_liner(text) or "（无简介）"
-            self._skills[name] = SkillMeta(name=name, path=fp, one_liner=one_liner)
+            skill_id = d.name
+            meta = _parse_meta(md, fallback_id=skill_id)
+            meta.path = doc_path
+            meta.source = "local"
 
-        return self._skills
+            self._skills[skill_id] = meta
+            self._cache_text[skill_id] = md
 
-    def catalog_text(self) -> str:
-        """
-        给模型看的技能目录（短文本）
-        """
-        self.maybe_rescan()
+        return len(self._skills)
 
-        if not self._skills:
-            return "（当前无可用 skills）"
-
-        lines = ["可用技能目录（需要时调用 load_skill(name) 读取全文）："]
-        for name, meta in sorted(self._skills.items(), key=lambda x: x[0]):
-            lines.append(f"- {name}: {meta.one_liner}")
-        return "\n".join(lines)
-
-    def load(self, name: str) -> str:
-        """
-        按需加载某个 skill 的 SKILL.md 全文（可缓存 + 截断）
-        """
-        self.maybe_rescan()
-
-        name = (name or "").strip()
-        if not name:
-            raise ValueError("skill name is empty")
-
-        if name in self._cache:
-            return self._cache[name]
-
-        meta = self._skills.get(name)
-        if not meta:
-            raise ValueError(
-                f"unknown skill: {name}. available={list(self._skills.keys())}"
+    @utils.timer
+    def list_skills(self, max_items: int = 200) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for k in sorted(self._skills.keys()):
+            meta = self._skills[k]
+            out.append(
+                {
+                    "id": meta.skill_id,
+                    "name": meta.display_name,
+                    "one_liner": meta.one_liner,
+                    "triggers": meta.triggers,
+                    "allowed_tools": meta.allowed_tools,
+                    "allowed_tools_explicit": meta.allowed_tools_explicit,
+                    "source": meta.source,
+                    "path": str(meta.path) if meta.path else None,
+                }
             )
+            if len(out) >= max_items:
+                break
+        return out
 
-        text = meta.path.read_text(encoding="utf-8", errors="ignore")
-        if len(text) > self.max_chars:
-            text = text[: self.max_chars] + "\n\n...[TRUNCATED]..."
+    @utils.timer
+    def load_skill(self, skill_id: str, max_chars: int = 60_000) -> str:
+        skill_id = (skill_id or "").strip()
+        if not skill_id:
+            return ""
+        txt = self._cache_text.get(skill_id)
+        if txt is None and skill_id in self._skills and self._skills[skill_id].path:
+            txt = _safe_read_text(self._skills[skill_id].path or Path("/dev/null"))
+            self._cache_text[skill_id] = txt
+        if txt is None:
+            sid = self._match_by_name(skill_id)
+            if sid:
+                return self.load_skill(sid, max_chars=max_chars)
+            return f"[skills_load] skill not found: {skill_id}"
+        return txt[:max_chars]
 
-        self._cache[name] = text
-        return text
-
-    @staticmethod
-    def _extract_one_liner(text: str) -> Optional[str]:
-        """
-        优先提取 '## 一句话简介' 下第一行非空文本
-        否则尝试从 '# SKILL:' 标题下一行提取
-        """
-        # 1) ## 一句话简介
-        m = re.search(r"^##\s*一句话简介\s*$([\s\S]*?)(^\s*---|\Z)", text, flags=re.M)
-        if m:
-            block = m.group(1)
-            for line in block.splitlines():
-                line = line.strip(" \t-#")
-                if line:
-                    return line
-
-        # 2) fallback: 第一段非空
-        for line in text.splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                return line
-
+    def _match_by_name(self, name: str) -> Optional[str]:
+        needle = (name or "").strip().lower()
+        if not needle:
+            return None
+        for sid, meta in self._skills.items():
+            if meta.display_name.strip().lower() == needle:
+                return sid
         return None
 
+    @utils.timer
+    def register_external(self, skill_id: str, content: str, overwrite: bool = False) -> Dict[str, Any]:
+        skill_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", (skill_id or "").strip())
+        if not skill_id:
+            return {"ok": False, "error": "empty skill_id"}
 
-def _safe_skill_name(name: str) -> str:
-    # 只允许 folder 名（防止 ../ 目录穿越）
-    if not re.fullmatch(r"[a-zA-Z0-9_\-]+", name or ""):
-        raise ValueError("invalid skill name (allowed: letters/digits/_/-)")
-    return name
+        target_dir = utils.get_skills_dir() / "_external" / skill_id
+        target_path = target_dir / "SKILL.md"
+        if target_path.exists() and not overwrite:
+            return {"ok": False, "error": "skill already exists", "path": str(target_path)}
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(content or "", encoding="utf-8")
+        self.scan_skills()
+        return {"ok": True, "id": skill_id, "path": str(target_path)}
+
+    def _visible_for_toolset(self, meta: SkillMeta, toolset: set[str]) -> bool:
+        if not meta.allowed_tools:
+            return True
+        return set(meta.allowed_tools).issubset(toolset)
+
+    @utils.timer
+    def search_cards(self, query: str, toolset: set[str], top_k: int = 8) -> List[SkillMeta]:
+        q = (query or "").strip().lower()
+        if not q:
+            return []
+
+        tokens = re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]{2,}", q, flags=re.IGNORECASE)
+        if not tokens:
+            tokens = [q]
+
+        scored: List[Tuple[float, SkillMeta]] = []
+        for meta in self._skills.values():
+            if not self._visible_for_toolset(meta, toolset):
+                continue
+            card_text = " ".join(
+                [
+                    meta.display_name or "",
+                    meta.one_liner or "",
+                    meta.description or "",
+                    " ".join(meta.triggers or []),
+                    " ".join(meta.allowed_tools or []),
+                ]
+            ).lower()
+
+            score = 0.0
+            for t in meta.triggers:
+                tl = (t or "").strip().lower()
+                if tl and tl in q:
+                    score += 5.0
+
+            for tok in tokens:
+                if tok in card_text:
+                    score += 1.0 + min(len(tok) / 8.0, 1.5)
+
+            if meta.display_name and meta.display_name.lower() in q:
+                score += 2.0
+
+            if score > 0:
+                scored.append((score, meta))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [m for _, m in scored[: max(1, int(top_k))]]
+
+    @utils.timer
+    def render_cards(self, metas: List[SkillMeta], max_items: int = 8) -> str:
+        metas = metas[:max_items]
+        if not metas:
+            return ""
+        lines: List[str] = []
+        lines.append("【Skill Cards（仅摘要，必要时用 skills_load 打开全文）】")
+        for i, m in enumerate(metas, 1):
+            tools = " ".join(m.allowed_tools) if m.allowed_tools else "(unspecified)"
+            trig = ", ".join(m.triggers[:12]) + ("..." if len(m.triggers) > 12 else "")
+            lines.append(
+                f"{i}. id={m.skill_id} | name={m.display_name}\n"
+                f"   one_liner={m.one_liner}\n"
+                f"   allowed_tools={tools}\n"
+                f"   triggers={trig}"
+            )
+        lines.append("\n选择规则：只选与你当前任务相关的少量技能；如需细节，调用 skills_load(id)。")
+        return "\n".join(lines)
+
+    @utils.timer
+    def render_full_docs(self, skill_ids: List[str], max_chars_total: int = 12_000) -> str:
+        if not skill_ids:
+            return ""
+        out: List[str] = ["【Selected Skills（全文/片段）】"]
+        remaining = max_chars_total
+        for sid in skill_ids:
+            doc = self.load_skill(sid, max_chars=remaining)
+            if not doc:
+                continue
+            if len(doc) > remaining:
+                doc = doc[:remaining]
+            out.append(f"\n===== SKILL: {sid} =====\n" + doc)
+            remaining -= len(doc)
+            if remaining <= 500:
+                break
+        return "\n".join(out)
 
 
-def _read_text(p: Path, max_chars: int = 20000) -> str:
-    return p.read_text(encoding="utf-8", errors="replace")[:max_chars]
+REGISTRY = SkillRegistry()
+REGISTRY.scan_skills()
 
-
-def _extract_title_and_summary(md: str) -> Tuple[str, str]:
-    lines = [ln.strip() for ln in (md or "").splitlines()]
-    title = ""
-    summary = ""
-
-    # title: 第一行 # xxx
-    for ln in lines:
-        if ln.startswith("#"):
-            title = ln.lstrip("#").strip()
-            break
-
-    # summary: 找第一行非空且不是标题的句子
-    for ln in lines:
-        if not ln or ln.startswith("#"):
-            continue
-        summary = ln
-        break
-
-    if not title:
-        title = "Untitled"
-    if not summary:
-        summary = ""
-    return title, summary
-
-
-WORKSPACE_ROOT = (
-    Path(utils.env("WORKSPACE.ROOT", str(DEFAULT_ROOT))).expanduser().resolve()
-)
-SKILLS_DIR = (
-    Path(utils.env("SKILLS.DIR", str(WORKSPACE_ROOT / "skills"))).expanduser().resolve()
-)
-# Backward-compat alias (older code uses SKILLS_ROOT)
-SKILLS_ROOT = SKILLS_DIR
-
-skill_registry = SkillRegistry(SKILLS_DIR, max_chars=50_000)
-skill_registry.scan()
-
-_SKILLS_MARK = "\n# === skills catalog (auto) ===\n"
-
-def with_skill_catalog(system_prompt: str, *, role: str) -> str:
-    role2skills = {
-        "researcher": ["web_search", "web_open"],
-        "solver": ["read_text_file", "run_command", "http_get"],
-        "writer": ["write_file", "render_markdown"],
-    }
-    skills = role2skills.get(role, [])
-    if not skills:
-        return system_prompt
-    catalog = "【可用技能】\n" + "\n".join(f"- {s}" for s in skills)
-    return system_prompt + "\n\n" + catalog
-
-
-# def scan_skills(max_items: int = 200) -> dict:
-#     """
-#     扫描 skills/<name>/SKILL.md，返回：
-#     {
-#       "index": {name: {"title":..., "summary":...}},
-#       "catalog_text": "...(适合塞 prompt 的目录文本)"
-#     }
-#     """
-#     index = {}
-#     if not SKILLS_ROOT.exists():
-#
-#         logger.error("SKILLS_ROOT does not exist")
-#
-#         return {"index": {}, "catalog_text": "No skills folder found."}
-#
-#     cnt = 0
-#     for d in sorted(SKILLS_ROOT.iterdir(), key=lambda x: x.name):
-#         if cnt >= max_items:
-#             break
-#         if not d.is_dir():
-#             continue
-#
-#         skill_name = d.name
-#         md_path = d / "SKILL.md"
-#         if not md_path.exists():
-#             continue
-#
-#         md = _read_text(md_path, max_chars=8000)
-#         title, summary = _extract_title_and_summary(md)
-#         index[skill_name] = {"title": title, "summary": summary}
-#         cnt += 1
-#
-#     # 生成精简目录（避免太长）
-#     lines = ["可用技能目录（按需用 load_skill(name) 加载详情）："]
-#     for name, meta in index.items():
-#         t = meta.get("title", "")
-#         s = meta.get("summary", "")
-#         if s:
-#             lines.append(f"- {name}: {t} — {s}")
-#         else:
-#             lines.append(f"- {name}: {t}")
-#     catalog_text = "\n".join(lines)
-#
-#     # 防止 prompt 过长：截断一下
-#     if len(catalog_text) > TRUNCATE_LOG_LEN:
-#         catalog_text = (
-#             catalog_text[:TRUNCATE_LOG_LEN]
-#             + "\n...(truncated, use list_skills/load_skill)"
-#         )
-#         logger.warning(
-#             f"WARNING: Skill catalog truncated from {len(catalog_text)} to {TRUNCATE_LOG_LEN} chars"
-#         )
-#
-#     logger.debug("\n".join(lines))
-#
-#     return {"index": index, "catalog_text": catalog_text}
-
-def _skills_list_impl(max_items: int = 200) -> dict:
-    # 触发自动刷新
-    skill_registry.maybe_rescan(ttl_s=0.0)  # 或 skill_registry.scan() 也行
-    skills = []
-    for i, (name, meta) in enumerate(sorted(skill_registry._skills.items(), key=lambda x: x[0])):
-        if i >= max_items:
-            break
-        skills.append({"name": name, "one_liner": meta.one_liner})
-    return {"ok": True, "count": len(skills), "skills": skills, "catalog_text": skill_registry.catalog_text()}
-
-@tool("skills_list")
-def skills_list(max_items: int = 200) -> dict:
-    """
-    列出当前可用的 skills（技能文档）目录与摘要信息。
-
-    说明：
-    - 本工具只用于“发现技能/查看目录”，不会执行任何技能步骤。
-    - 返回内容包含：skills 列表（name/one_liner）以及可用于提示词注入的 catalog_text。
-    - 如需查看某个技能的完整说明，请调用 skills_load(name)。
-
-    Args:
-        max_items: 最多返回多少条技能目录项（用于控制输出大小/token）。
-
-    Returns:
-        dict: {
-          "ok": bool,
-          "count": int,
-          "skills": [{"name": str, "one_liner": str}, ...],
-          "catalog_text": str
-        }
-    """
-    return _skills_list_impl(max_items=max_items)
-
-@tool("skills_load")
-def skills_load(name: str) -> str:
-    """
-    加载指定 skill 的 SKILL.md 全文（技能说明/执行步骤/注意事项）。
-
-    说明：
-    - 本工具只“读取技能文档内容”，不会执行技能中提到的任何命令或工具流程。
-    - name 必须是安全的目录名（由 _safe_skill_name 校验），防止路径穿越。
-    - 当 skills 目录发生变更时，会先触发一次 rescan（ttl_s=0.0）。
-
-    Args:
-        name: 技能名（对应 skills/<name>/SKILL.md）。
-
-    Returns:
-        str: 技能文档全文（可能按 max_chars 截断，取决于 skill_registry 的配置）。
-    """
-    skill_registry.maybe_rescan(ttl_s=0.0)
-    name = _safe_skill_name((name or "").strip())
-    return skill_registry.load(name)
-
+@utils.timer
 @tool("skills_rescan")
-def skills_rescan(max_items: int = 200) -> dict:
+def skills_rescan() -> str:
+    """Rescan skills directory and refresh cache."""
+    t0 = time.time()
+    n = REGISTRY.scan_skills()
+    return f"skills_rescan ok: {n} skills, cost={time.time()-t0:.3f}s"
+
+@utils.timer
+@tool("skills_list")
+def skills_list(max_items: int = 200) -> str:
+    """List skills (metadata only)."""
+    items = REGISTRY.list_skills(max_items=int(max_items))
+    return json.dumps(items, ensure_ascii=False, indent=2, default=str)[:TRUNCATE_LOG_LEN]
+
+@utils.timer
+@tool("skills_load")
+def skills_load(skill_id: str, max_chars: int = 60_000) -> str:
+    """Load a skill markdown by id (folder name) or display name."""
+    return REGISTRY.load_skill(skill_id, max_chars=int(max_chars))[:TRUNCATE_LOG_LEN]
+
+@utils.timer
+@tool("skills_register")
+def skills_register(skill_id: str, content: str, overwrite: bool = False) -> str:
+    """Register a skill from raw markdown content (e.g., fetched online).
+
+    The skill is written under: skills/_external/<skill_id>/SKILL.md.
+    Then the registry is rescanned.
     """
-    重新扫描 skills 目录并刷新缓存，然后返回最新的 skills 目录。
-
-    说明：
-    - 用于显式刷新（通常不必频繁调用；skills_list/skills_load 已可触发自动刷新）。
-    - 本工具同样不会执行技能步骤，仅更新技能索引与缓存。
-
-    Args:
-        max_items: 最多返回多少条技能目录项。
-
-    Returns:
-        dict: 同 skills_list 的返回结构。
-    """
-    skill_registry.scan()
-    return _skills_list_impl(max_items=max_items)
+    res = REGISTRY.register_external(skill_id, content, overwrite=bool(overwrite))
+    return json.dumps(res, ensure_ascii=False, indent=2, default=str)[:TRUNCATE_LOG_LEN]

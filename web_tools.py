@@ -8,6 +8,7 @@ from typing import List, Dict, Any
 
 from langchain_core.tools import tool
 
+import utils
 from const import (
     WEB_SEARCH_MAX_RESULTS,
     WEB_SEARCH_RECENCY_DAYS,
@@ -160,7 +161,7 @@ def http_json(
 
     return json.loads(txt)
 
-
+@utils.timer
 @tool("http_get")
 def http_get(url: str, max_chars: int = 12000, timeout_s: int = 15) -> str:
     """Simple HTTP GET. Returns first max_chars characters of the response body."""
@@ -415,7 +416,7 @@ def _select_search_backend() -> SearchBackend:
 
 _SEARCH_BACKEND: SearchBackend = _select_search_backend()
 
-
+@utils.timer
 @tool("web_search")
 def web_search(
     query: str,
@@ -463,7 +464,7 @@ def web_search(
             }
         ]
 
-
+@utils.timer
 @tool("web_open")
 def web_open(
     url: str, max_chars: int = WEB_MAX_CHARS, timeout_s: int = WEB_TIMEOUT_S

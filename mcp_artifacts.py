@@ -14,6 +14,8 @@ from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
 
+import utils
+
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 logger = logging.getLogger("mcp_artifacts")
 
@@ -54,6 +56,8 @@ def _coerce_artifacts_path(p: str) -> str:
     if p == _ARTIFACTS_PREFIX or p.startswith(_ARTIFACTS_PREFIX + "/"):
         return p
     return f"{_ARTIFACTS_PREFIX}/{p}"
+
+@utils.timer
 @mcp.tool()
 def ensure_dir(
     path: str
@@ -65,7 +69,7 @@ def ensure_dir(
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
     return _invoke("ensure_dir", path=safe_path)
 
-
+@utils.timer
 @mcp.tool()
 def write_text_file(
     path: str, content: str, mode: str = "overwrite", encoding: str = "utf-8"
@@ -77,7 +81,7 @@ def write_text_file(
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
     return _invoke("write_text_file", path=safe_path, content=content, mode=mode, encoding=encoding)
 
-
+@utils.timer
 @mcp.tool()
 def save_mermaid_diagram(
     mermaid_code: str, filename: str = "diagram.md"
@@ -89,7 +93,7 @@ def save_mermaid_diagram(
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
     return _invoke("save_mermaid_diagram", mermaid_code=mermaid_code, filename=safe_filename)
 
-
+@utils.timer
 @mcp.tool()
 def create_plotly_chart(
     chart_type: str,
@@ -118,7 +122,7 @@ def create_plotly_chart(
         height=height,
     )
 
-
+@utils.timer
 @mcp.tool()
 def save_chart_data(
     data: str, filename: str = "chart_data.json", format: str = "json"

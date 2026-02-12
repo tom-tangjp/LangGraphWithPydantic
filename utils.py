@@ -3,6 +3,10 @@ import json
 import logging
 import os
 import re
+import time
+from functools import wraps
+from os import getenv
+from pathlib import Path
 from typing import Any, Dict, List, Set
 
 from langchain_core.messages import BaseMessage, ToolMessage, AIMessage, SystemMessage
@@ -172,7 +176,7 @@ def check_llm_provider(provider: str, model: str) -> bool:
         )
         return False
     key_api_key = f"{key_provider}.api_key"
-    if get_config(key_api_key, default="") == "":
+    if lower_provider != "ollama" and get_config(key_api_key, default="") == "":
         logger.error(
             f"LLM provider {lower_provider} api_key not configured. Please set {key_api_key} in config."
         )
@@ -204,7 +208,7 @@ def msg_preview(msgs, n=2):
         out.append(
             {
                 "type": type(m).__name__,
-                "content": truncate(getattr(m, "content", ""), 180),
+                "content": getattr(m, "content", ""),
             }
         )
     return out
@@ -800,3 +804,25 @@ def filter_messages_for_llm(
         cleaned.append(mm)
     # print(cleaned)
     return cleaned
+
+def get_workspace_root() -> Path:
+    env_root = os.getenv("WORKSPACE_ROOT")
+    if env_root is not None:
+        return Path(env_root).expanduser().resolve()
+    return Path(getenv("WORKSPACE.ROOT", ".")).expanduser().resolve()
+
+def get_skills_dir() -> Path:
+    env_skills = os.getenv("SKILLS_DIR")
+    if env_skills is not None:
+        return Path(env_skills).expanduser().resolve()
+    return Path(getenv("SKILLS.DIR", get_workspace_root())).expanduser().resolve()
+
+def timer(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        end = time.perf_counter()
+        print(f"{func.__name__} 耗时: {end - start:.6f} 秒")
+        return result
+    return wrapper

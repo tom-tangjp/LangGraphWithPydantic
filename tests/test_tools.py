@@ -7,6 +7,8 @@ from unittest.mock import patch
 
 import pytest
 
+import utils
+
 
 class TestToolImports:
     """Tests for tool imports and registration."""
@@ -31,7 +33,7 @@ class TestToolRegistry:
         from tools import TOOL_REGISTRY
 
         expected_tools = [
-            "read_text_file",
+            "read_file",
             "list_dir",
             "grep_text",
             "run_bash",
@@ -47,7 +49,7 @@ class TestToolRegistry:
         from tools import TOOL_REGISTRY
 
         # Lowercase should work
-        assert "read_text_file" in TOOL_REGISTRY
+        assert "read_file" in TOOL_REGISTRY
 
 
 class TestRunBash:
@@ -115,21 +117,19 @@ class TestPathResolution:
     def test_resolve_under_root_basic(self):
         """Test basic path resolution."""
         from tools import _resolve_under_root
-        from skills_registry import WORKSPACE_ROOT
 
         # Test with absolute path within workspace
-        test_path = WORKSPACE_ROOT / "test.txt"
+        test_path = utils.get_workspace_root() / "test.txt"
         result = _resolve_under_root(str(test_path))
         assert result == test_path
 
     def test_resolve_under_root_relative(self):
         """Test relative path resolution."""
         from tools import _resolve_under_root
-        from skills_registry import WORKSPACE_ROOT
 
         # Test with relative path
         result = _resolve_under_root("subdir/file.txt")
-        expected = WORKSPACE_ROOT / "subdir/file.txt"
+        expected = utils.get_workspace_root() / "subdir/file.txt"
         assert result == expected
 
 
@@ -173,21 +173,6 @@ class TestListSourceFiles:
         assert "ok" in data
         assert "count" in data
         assert "files" in data
-
-
-class TestBatchReadSourceFiles:
-    """Tests for batch_read_source_files - basic checks."""
-
-    def test_batch_read_empty_list(self):
-        """Test batch reading with empty list."""
-        from tools import batch_read_source_files
-
-        result = batch_read_source_files.invoke({"paths": []})
-        data = json.loads(result)
-
-        assert data["ok"] is True
-        assert data["total_files"] == 0
-        assert data["success_count"] == 0
 
 
 class TestGetSourceMetrics:
@@ -292,9 +277,8 @@ class TestEnsureDir:
     def test_ensure_dir_in_workspace(self):
         """Test creating directory in workspace."""
         from tools import ensure_dir
-        from skills_registry import WORKSPACE_ROOT
 
-        test_dir = WORKSPACE_ROOT / "test_ensure_dir_created"
+        test_dir = utils.get_workspace_root() / "test_ensure_dir_created"
         try:
             result = ensure_dir.invoke({"path": "test_ensure_dir_created"})
             data = json.loads(result)
@@ -312,9 +296,8 @@ class TestWriteTextFile:
     def test_write_text_file_in_workspace(self):
         """Test writing file in workspace."""
         from tools import write_text_file
-        from skills_registry import WORKSPACE_ROOT
 
-        test_file = WORKSPACE_ROOT / "test_write_file.txt"
+        test_file = utils.get_workspace_root() / "test_write_file.txt"
         try:
             result = write_text_file.invoke({
                 "path": "test_write_file.txt",
@@ -336,9 +319,8 @@ class TestMermaidDiagram:
     def test_save_mermaid_diagram_in_workspace(self):
         """Test saving mermaid diagram in workspace."""
         from tools import save_mermaid_diagram
-        from skills_registry import WORKSPACE_ROOT
 
-        test_file = WORKSPACE_ROOT / "test_diagram.md"
+        test_file = utils.get_workspace_root() / "test_diagram.md"
         try:
             result = save_mermaid_diagram.invoke({
                 "mermaid_code": "graph TD\n    A-->B",

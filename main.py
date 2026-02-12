@@ -3,11 +3,10 @@ import logging
 import os
 import uuid
 
+import utils
 from agent import AgentState
 from utils import truncate
 from llm import build_llm, build_reflection_multi_agent_graph
-from skills_registry import WORKSPACE_ROOT, SKILLS_DIR
-
 
 def setup_logging(level=logging.INFO):
     # 【关键】在这里统一配置
@@ -141,7 +140,7 @@ if __name__ == "__main__":
 
     logger = logging.getLogger(__name__)
 
-    logger.info(f"[boot] WORKSPACE_ROOT={WORKSPACE_ROOT} SKILLS_DIR={SKILLS_DIR}")
+    logger.info(f"[boot] WORKSPACE_ROOT={utils.get_workspace_root()} SKILLS_DIR={utils.get_skills_dir()}")
 
     question = args.question
 

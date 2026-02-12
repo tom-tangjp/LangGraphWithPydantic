@@ -22,7 +22,7 @@ llm:
       base_url: ""
       api_key: ""
     ollama:
-      base_url: "http://localhost:11434"
+      base_url: "http://localhost:11435"
       api_key: ""  # Ollama 通常不需要 API key
     deepseek:
       base_url: "https://api.deepseek.com"
@@ -57,6 +57,37 @@ python:
 
 # 角色特定配置（覆盖全局配置）
 # intent: 意图分析角色
+#intent:
+#  provider: "qwen"
+#  model: "qwen2-1.5b-instruct"
+#
+## planner: 规划角色
+#planner:
+#  provider: "qwen"
+#  model: "qwen-max"
+#
+## agent: 执行角色（researcher/solver/writer）
+#agent:
+#  provider: "qwen"
+#  model: "qwen-max"
+#
+#researcher:
+#  provider: "qwen"
+#  model: "qwen-long"
+#
+#solver:
+#  provider: "qwen"
+#  model: "qwen-turbo"
+#
+#writer:
+#  provider: "qwen"
+#  model: "qwen-plus"
+#
+#reflector:
+#  provider: "qwen"
+#  model: "qwen-plus"
+
+
 intent:
   provider: "qwen"
   model: "qwen2-1.5b-instruct"
@@ -86,16 +117,3 @@ writer:
 reflector:
   provider: "qwen"
   model: "qwen-plus"
-
-
-# 备用配置示例（注释状态）
-# 以下示例展示了如何为不同角色配置不同的模型：
-# intent:
-#   provider: "qwen"
-#   model: "qwen-plus"
-# planner:
-#   provider: "openai"
-#   model: "gpt-4o"
-# agent:
-#   provider: "doubao"
-#   model: "doubao-pro-32k"

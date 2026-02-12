@@ -14,6 +14,8 @@ from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
 
+import utils
+
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 logger = logging.getLogger("mcp_net")
 
@@ -58,6 +60,8 @@ def _domain_allowed(url: str) -> Union[bool, str]:
         if host == d or host.endswith("." + d):
             return True
     return f"domain not allowed: {host}"
+
+@utils.timer
 @mcp.tool()
 def web_search(
     query: str, max_results: int = 5
@@ -72,7 +76,7 @@ def web_search(
     except Exception:
         return _invoke("web_search", q=query, max_results=max_results)
 
-
+@utils.timer
 @mcp.tool()
 def web_open(
     url: str, max_chars: int = 20000
@@ -86,7 +90,7 @@ def web_open(
         return json.dumps({"ok": False, "error": str(ok)}, ensure_ascii=False)
     return _invoke("web_open", url=url, max_chars=max_chars)
 
-
+@utils.timer
 @mcp.tool()
 def http_get(
     url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 30
