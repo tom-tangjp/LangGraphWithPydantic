@@ -1,0 +1,7 @@
+.env.example
+config.yaml
+.github/
+.idea/
+__pycache__/
+test/__pycache__/
+*.log
