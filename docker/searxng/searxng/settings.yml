@@ -1,0 +1,161 @@
+# SearXNG settings.yml (drop-in replacement)
+# Docs:
+# - Settings: https://docs.searxng.org/admin/settings/settings.html
+# - Engine list / exact engine "name": https://docs.searxng.org/user/configured_engines.html
+
+use_default_settings:
+  engines:
+    # Keep only the engines listed here from the default settings.
+    # (You can still add your own custom engines under `engines:` below if you want.)
+    keep_only:
+      # -------- general / web --------
+      - bing
+      - qwant
+      - mojeek
+      - wiby
+      - yahoo
+      - wikipedia
+      - wikidata
+      - currency
+
+      # -------- news --------
+      - "bing news"
+      - "qwant news"
+      - reuters
+      - "yahoo news"
+      - "mojeek news"
+
+      # -------- it / code --------
+      - github
+      - gitlab
+      - huggingface
+      - "huggingface datasets"
+      - "huggingface spaces"
+
+      - stackoverflow
+      - superuser
+      - askubuntu
+
+      - pypi
+      - npm
+      - "pkg.go.dev"
+      - "crates.io"
+      - "lib.rs"
+      - "docker hub"
+
+      - mdn
+      - "microsoft learn"
+      - mankier
+
+      # -------- science / academic --------
+      - arxiv
+      - crossref
+      - openalex
+      - pubmed
+      - "semantic scholar"
+
+server:
+  # base_url is defined in the SEARXNG_BASE_URL environment variable (docker-compose.yml)
+  secret_key: "8c84f652401e6ffef6f9dd1775ae074e7ab7edcb6cef76d0493cd064e855bf14"  # keep or change
+  limiter: false
+  image_proxy: true
+
+search:
+  formats:
+    - html
+    - json
+
+# Show only these main tabs in UI
+categories_as_tabs:
+  general:
+  it:
+  science:
+  news:
+
+# Explicitly enable the engines we kept (many are disabled by default in upstream settings)
+engines:
+  # -------- general / web --------
+  - name: bing
+    disabled: false
+  - name: qwant
+    disabled: false
+  - name: mojeek
+    disabled: false
+  - name: wiby
+    disabled: false
+  - name: yahoo
+    disabled: false
+  - name: wikipedia
+    disabled: false
+  - name: wikidata
+    disabled: false
+  - name: currency
+    disabled: false
+
+  # -------- news --------
+  - name: "bing news"
+    disabled: false
+  - name: "qwant news"
+    disabled: false
+  - name: reuters
+    disabled: false
+  - name: "yahoo news"
+    disabled: false
+  - name: "mojeek news"
+    disabled: false
+
+  # -------- it / code --------
+  - name: github
+    disabled: false
+  - name: gitlab
+    disabled: false
+  - name: huggingface
+    disabled: false
+  - name: "huggingface datasets"
+    disabled: false
+  - name: "huggingface spaces"
+    disabled: false
+
+  - name: stackoverflow
+    disabled: false
+  - name: superuser
+    disabled: false
+  - name: askubuntu
+    disabled: false
+
+  - name: pypi
+    disabled: false
+  - name: npm
+    disabled: false
+  - name: "pkg.go.dev"
+    disabled: false
+  - name: "crates.io"
+    disabled: false
+  - name: "lib.rs"
+    disabled: false
+  - name: "docker hub"
+    disabled: false
+
+  - name: mdn
+    disabled: false
+  - name: "microsoft learn"
+    disabled: false
+  - name: mankier
+    disabled: false
+
+  # -------- science / academic --------
+  - name: arxiv
+    disabled: false
+  - name: crossref
+    disabled: false
+  - name: openalex
+    disabled: false
+  - name: pubmed
+    disabled: false
+  - name: "semantic scholar"
+    disabled: false
+
+# You are using valkey/redis protocol in docker-compose; keep redis URL as-is
+redis:
+  url: redis://redis:6379/0
+

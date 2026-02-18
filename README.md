@@ -4,23 +4,24 @@
 
 ## 功能概览
 
-- 多角色闭环：`intent → initial_plan → (agent ↔ tools ↔ reflect)* → respond`（见 `llm.py`）
-- 结构化输出：`IntentModel / PlanModel / ReflectModel` 全部走 Pydantic schema（见 `agent.py`、`llm.py`）
-- 工具隔离：工具通过 MCP 子进程暴露，分为只读、受控执行、产物写入（见 `mcp_ro.py`、`mcp_exec_safe.py`、`mcp_artifacts.py`）
-- 安全兜底：工具输出做截断、连续工具调用熔断、shell 默认禁用（见 `llm.py`、`mcp_shell.py`）
-- 可视化调试：Streamlit UI 展示步骤进度、日志、Token 统计、Mermaid 时序图（见 `ui_streamlit.py`、`trace_visualizer.py`）
+- 多角色闭环：`intent → initial_plan → (agent ↔ tools ↔ reflect)* → respond`（见 `src/clawflow/agents/llm.py`）
+- 结构化输出：`IntentModel / PlanModel / ReflectModel` 全部走 Pydantic schema（见 `src/clawflow/agents/agent.py`、`src/clawflow/agents/llm.py`）
+- 工具隔离：工具通过 MCP 子进程暴露，分为只读、受控执行、产物写入（见 `tools/src/my_tools/mcp_ro.py`、`tools/src/my_tools/mcp_exec_safe.py`、`tools/src/my_tools/mcp_artifacts.py`）
+- 安全兜底：工具输出做截断、连续工具调用熔断、shell 默认禁用（见 `src/clawflow/agents/llm.py`、`tools/src/my_tools/mcp_shell.py`）
+- 可视化调试：Streamlit UI 展示步骤进度、日志、Token 统计、Mermaid 时序图（见 `ui_streamlit/ui_streamlit.py`、`ui_streamlit/trace_visualizer.py`）
 
 ## 目录结构（核心文件）
 
-- `main.py`：命令行入口，构建图并运行一次请求
-- `ui_streamlit.py`：Streamlit 调试 UI（流式运行图、展示 traces/步骤/Token）
-- `llm.py`：LLM 构建、LangGraph 编排、ToolNode 安全执行、Reflection/Respond 节点
-- `agent.py`：状态与结构化 schema（Intent/Plan/Reflect/State）
-- `tools.py`：本地工具实现（读写文件、grep、运行受控命令、代码度量/图表等）
-- `mcp_adapter.py`：把 MCP 工具转成 LangChain `StructuredTool`，并管理子进程 session
-- `mcp_ro.py` / `mcp_exec_safe.py` / `mcp_artifacts.py`：MCP 服务端（只读/受控执行/写产物）
-- `web_tools.py`：Web 搜索与抓取（支持 `searxng/tavily/serpapi/bing/none`）
-- `skills/`：技能文档（`skills_registry.py` 会扫描并提供 `skills_list/skills_load` 工具）
+- `src/clawflow/main.py`：命令行入口，构建图并运行一次请求
+- `src/clawflow/agents/llm.py`：LLM 构建、LangGraph 编排、MCP 工具初始化、反思/响应节点
+- `src/clawflow/agents/agent.py`：状态与结构化 schema（Intent/Plan/Reflect/State）
+- `src/clawflow/skills/`：技能加载与内置技能数据（默认技能在 `src/clawflow/skills/data/`）
+- `ui_streamlit/ui_streamlit.py`：Streamlit 调试 UI（流式运行图、展示 traces/步骤/Token）
+- `ui_streamlit/trace_visualizer.py`：把 traces 转成 Mermaid 时序图
+- `tools/src/my_tools/`：独立的 `my_tools` 包（MCP 服务端、工具实现、Web 工具）
+  - `tools/src/my_tools/tools.py`：工具实现与注册（文件/grep/git/受控执行/patch 等）
+  - `tools/src/my_tools/mcp_*.py`：按权限拆分的 MCP 服务端
+  - `tools/src/my_tools/web_tools.py`：网络检索/抓取工具（按 `SEARCH_BACKEND/SEARXNG_URL` 等选择后端）
 
 ## 环境要求
 
@@ -33,7 +34,10 @@
 
 ```bash
 pip install -r requirements.txt
+pip install -e tools
 ```
+
+说明：`my_tools` 是一个独立包（位于 `tools/`），`src/clawflow/agents/llm.py` 默认会通过 `my_tools.mcp_*` 启动 MCP 子进程，因此需要先把它装到当前 Python 环境里。
 
 ## 快速开始（推荐）
 
@@ -45,16 +49,18 @@ cp config_example/config.yaml config.yaml
 
 2) 编辑 `config.yaml`（至少设置工作区、技能目录、四个角色模型与 provider 连接信息）：
 
-- `workspace.root`：工具读写/扫描的根目录
-- `skills.dir`：技能目录（默认 `./skills`）
+- `workspace.root`：工具读写/扫描的根目录（例如 `./ui_streamlit/workspace`）
+- `skills.dir`：技能目录（内置技能默认在 `./src/clawflow/skills/data`）
 - `intent/planner/agent/reflector`：每个角色的 `provider`/`model`
 - `llm.providers.<provider>.base_url/api_key`：对应 provider 的连接信息（`ollama` 通常不需要 `api_key`）
+- `search.backend`：搜索后端（`searxng | tavily | serpapi | bing | none`）
+- `search.url`：当 `search.backend=searxng` 时使用的 SearxNG URL（注意：代码读取的是 `search.url`，不是 `searxng.url`）
 
 3) 启动（先用 CLI 验证一轮，再用 UI 调试）：
 
 ```bash
-python main.py --question "用一句话解释这个项目是做什么的"
-streamlit run ui_streamlit.py
+python -m src.clawflow.main --question "用一句话解释这个项目是做什么的"
+streamlit run ui_streamlit/ui_streamlit.py
 ```
 
 ## 配置说明（环境变量 / 配置文件）
@@ -63,24 +69,25 @@ streamlit run ui_streamlit.py
 
 整体优先级可理解为：
 
-1) 同名环境变量（如 `WORKSPACE.ROOT`）
-2) `config.yaml/config.yml/config.json`（按顺序找到第一个就用）
-3) 默认值
+1) 同名“直读环境变量”（例如代码里读 `WORKSPACE.ROOT` / `INTENT.PROVIDER` 这类 key；一般用于 Docker Compose 等场景）
+2) `AGENT_*` 环境变量（推荐在本地 shell 用这种方式覆盖；会被映射到配置的层级结构）
+3) `config.yaml`（仓库根目录；优先级高于 `.env`）
+4) 默认值
 
-说明：代码里也支持读取 `.env`，但它是“简易 key=value 读取”，不建议作为主配置来源（推荐统一写到 `config.yaml`）。
+说明：`.env` 仅支持最简单的 `key=value` 读取，且不支持层级结构；建议以 `config.yaml` 为主。
 
 ### 必需配置（最小可跑）
 
-`ui_streamlit.py` 启动会校验：
+`ui_streamlit/ui_streamlit.py` 启动会校验：
 
-- `WORKSPACE.ROOT`
-- `SKILLS.DIR`
-- `SEARCH.BACKEND`
-- `INTENT.PROVIDER` / `INTENT.MODEL`
-- `PLANNER.PROVIDER` / `PLANNER.MODEL`
-- `AGENT.PROVIDER` / `AGENT.MODEL`
+- `WORKSPACE.ROOT`（或通过 `AGENT_WORKSPACE_ROOT` 映射得到）
+- `SKILLS.DIR`（或通过 `AGENT_SKILLS_DIR` 映射得到）
+- `SEARCH.BACKEND`（或通过 `AGENT_SEARCH_BACKEND` 映射得到）
+- `INTENT.PROVIDER` / `INTENT.MODEL`（或 `AGENT_INTENT_PROVIDER` / `AGENT_INTENT_MODEL`）
+- `PLANNER.PROVIDER` / `PLANNER.MODEL`（或 `AGENT_PLANNER_PROVIDER` / `AGENT_PLANNER_MODEL`）
+- `AGENT.PROVIDER` / `AGENT.MODEL`（或 `AGENT_AGENT_PROVIDER` / `AGENT_AGENT_MODEL`）
 
-另外，构建图时还需要 `REFLECTOR.PROVIDER` / `REFLECTOR.MODEL`（见 `llm.py` 的 `build_llm()`）。
+另外，构建图时还需要 `REFLECTOR.PROVIDER` / `REFLECTOR.MODEL`（见 `src/clawflow/agents/llm.py` 的 `build_llm()`）。
 
 ### 关键配置项（对应 `config_example/config.yaml`）
 
@@ -94,7 +101,7 @@ streamlit run ui_streamlit.py
   - `skills.dir`
 - 搜索：
   - `search.backend`：`searxng | tavily | serpapi | bing | none`
-  - `searxng.url`：当 backend=searxng
+  - `search.url`：当 backend=searxng（会被写入运行时环境变量 `SEARXNG_URL` 供 `my_tools` 使用）
   - `tavily.api_key` / `serpapi.api_key` / `bing.api_key`：当 backend=对应服务
 - 日志：
   - `log.level`：如 `INFO`
@@ -102,35 +109,39 @@ streamlit run ui_streamlit.py
 
 ### 环境变量常用清单
 
-如果你不想改配置文件，也可以用环境变量覆盖（推荐在 Docker / CI / 临时调试时使用）：
+如果你不想改配置文件，也可以用环境变量覆盖：
 
-- 运行基础：`WORKSPACE.ROOT`、`SKILLS.DIR`、`SEARCH.BACKEND`、`LOG.LEVEL`
-- 角色模型：`INTENT.* / PLANNER.* / AGENT.* / REFLECTOR.*`（例如 `INTENT.PROVIDER=ollama`、`INTENT.MODEL=qwen3:32b`）
-- Provider 连接：`LLM.PROVIDERS.<PROVIDER>.BASE_URL`、`LLM.PROVIDERS.<PROVIDER>.API_KEY`
-- 搜索：`SEARXNG.URL`、`TAVILY.API_KEY`、`SERPAPI.API_KEY`、`BING.API_KEY`
+- 推荐（本地 shell）：使用 `AGENT_*` 前缀覆盖层级配置，例如：
+  - `AGENT_WORKSPACE_ROOT`、`AGENT_SKILLS_DIR`
+  - `AGENT_SEARCH_BACKEND`、`AGENT_SEARCH_URL`
+  - `AGENT_INTENT_PROVIDER` / `AGENT_INTENT_MODEL`
+  - `AGENT_PLANNER_PROVIDER` / `AGENT_PLANNER_MODEL`
+  - `AGENT_AGENT_PROVIDER` / `AGENT_AGENT_MODEL`
+  - `AGENT_REFLECTOR_PROVIDER` / `AGENT_REFLECTOR_MODEL`
+- Docker/Compose：可以直接设置代码读取的同名 key（例如 `WORKSPACE.ROOT`、`INTENT.PROVIDER`），但这类带点号的变量名不适合在普通 shell 里 `export`。
 - 调试：`AGENT_LOG_LLM_DUMP=1`、`LOG.LLM.CONTENT=1`、`MAX_TOOL_CALLS_PER_TURN=1`
 
-安全提醒：仓库里的 `run.sh` / `run_streamlit.sh` 是本地脚本示例，包含绝对路径与敏感开关示例；请勿把真实 API Key 写入并提交到仓库。
+安全提醒：请勿把真实 API Key 写入并提交到仓库。
 
 ## 运行方式
 
 ### 1) 命令行（单次请求）
 
 ```bash
-python main.py --question "用一句话解释这个项目是做什么的"
+python -m src.clawflow.main --question "用一句话解释这个项目是做什么的"
 ```
 
-说明：`main.py` 本身是“驱动 LangGraph 跑一轮”的 CLI 包装。最稳妥的方式还是把模型与 provider 连接信息写入 `config.yaml`，然后直接运行。
+说明：`src/clawflow/main.py` 本身是“驱动 LangGraph 跑一轮”的 CLI 包装。最稳妥的方式还是把模型与 provider 连接信息写入 `config.yaml`，然后直接运行。
 
-（如果你希望完全靠命令行覆盖配置：请优先用环境变量覆盖 `INTENT.* / PLANNER.* / AGENT.* / REFLECTOR.*` 与 `LLM.PROVIDERS.*`，因为 LLM 初始化读取的是这些 key。）
+（如果你希望用命令行/环境变量覆盖配置：本地 shell 推荐用 `AGENT_*` 环境变量覆盖角色 provider/model（如 `AGENT_INTENT_PROVIDER`、`AGENT_PLANNER_MODEL`）；provider 连接信息（`llm.providers.*` 的 `base_url/api_key`）建议仍写在 `config.yaml`。）
 
 ### 2) Streamlit UI（推荐调试）
 
 ```bash
-streamlit run ui_streamlit.py
+streamlit run ui_streamlit/ui_streamlit.py
 ```
 
-UI 启动时会校验关键配置：`WORKSPACE.ROOT / SKILLS.DIR / SEARCH.BACKEND / INTENT.* / PLANNER.* / AGENT.*`（见 `ui_streamlit.py`）。
+UI 启动时会校验关键配置：`WORKSPACE.ROOT / SKILLS.DIR / SEARCH.BACKEND / INTENT.* / PLANNER.* / AGENT.*`（见 `ui_streamlit/ui_streamlit.py`）。
 
 ### 3) 启动搜索依赖（可选：SearxNG）
 
@@ -149,7 +160,7 @@ cd searxng-docker
 docker compose up -d
 ```
 
-启动后将 `SEARXNG.URL`（或 `searxng.url`）指向 `http://localhost:8080`（默认端口）。
+启动后将 `AGENT_SEARCH_URL`（或 `search.url`）指向 `http://localhost:8080`（默认端口）。
 
 ### 4) Docker Compose（可选：容器化跑 UI + SearxNG）
 
@@ -158,14 +169,14 @@ docker compose up --build
 ```
 
 - 端口：`8080`（SearxNG）、`8501`（Streamlit，需自行切换容器启动命令）
-- 说明：当前 `Dockerfile` 默认 CMD 指向 `chainlit run app.py`，但仓库里未提供 `app.py`。如果你只想跑 Streamlit，建议在本机直接 `streamlit run ui_streamlit.py`，或自行改 Docker 启动命令。
+- 说明：当前 `Dockerfile` 默认 CMD 指向 `chainlit run app.py`，但仓库里未提供 `app.py`；如需容器化运行，请自行调整启动命令（例如改为 `streamlit run ui_streamlit/ui_streamlit.py`）。
 
 ## 运行机制（简述）
 
 - `intent`：将用户请求解析为结构化意图（严格 JSON schema，禁止工具调用）
 - `initial_plan/dynamic_plan`：生成（或动态追加）可执行步骤，步骤角色包括 `researcher/solver/writer/code_researcher/code_reviewer`
 - `agent_node`：按 step 执行，允许产生 tool_calls
-- `safe_tool_node`：执行工具并对输出做强截断，避免 token 爆炸（见 `llm.py:863`）
+- `safe_tool_node`：执行工具并对输出做强截断，避免 token 爆炸（见 `src/clawflow/agents/llm.py`）
 - `reflect`：按验收标准决定 `accept/retry/revise_plan/finish/generate_next_step`
 - `respond`：汇总 artifacts 输出最终答复（禁止工具）
 
@@ -173,43 +184,24 @@ docker compose up --build
 
 本项目把“工具能力”拆成两层：
 
-1) `tools.py`：定义本地 LangChain `@tool`（文件/代码/命令/可视化等）
-2) `mcp_*.py`：把 `tools.py` 里的工具按权限分组，通过 MCP（stdio 子进程）暴露给 LangGraph
+1) `tools/src/my_tools/tools.py`：定义本地 LangChain `@tool`（文件/代码/命令/可视化等）
+2) `tools/src/my_tools/mcp_*.py`：把 `tools/src/my_tools/tools.py` 里的工具按权限分组，通过 MCP（stdio 子进程）暴露给 LangGraph
 
-LangGraph 侧通过 `mcp_adapter.py` 启动子进程并拉取 tool schema，`llm.py` 的 `init_mcp_tools()` 会把工具按角色聚合并注册到全局 `TOOL_REGISTRY` 供 `safe_tool_node` 分发。
+LangGraph 侧在 `src/clawflow/agents/llm.py` 的 `init_mcp_tools()` 中启动子进程并拉取 tool schema，然后把工具按角色聚合供节点分发。
 
-### 工具清单（按 MCP 服务端分组）
+### 工具与服务端（概览）
 
-**1) 只读工具（`mcp_ro.py`）**：不执行外部命令、不联网、不写文件，主要用于读取与分析。
+- 只读：`tools/src/my_tools/mcp_ro.py`（例如 `read_file`、`list_dir`、`grep_text`、`git_diff` 等）
+- 受控执行：`tools/src/my_tools/mcp_exec_safe.py`（例如 `run_safe_command`、`run_tests`、`format_code` 等，受开关控制）
+- 产物写入：`tools/src/my_tools/mcp_artifacts.py`（例如 `write_text_file`、`save_mermaid_diagram` 等）
+- Shell（危险）：`tools/src/my_tools/mcp_shell.py`（`run_bash`，默认禁用）
+- 网络（可选）：`tools/src/my_tools/mcp_net.py` 与 `tools/src/my_tools/web_tools.py`（`web_search/web_open/http_get`）
 
-- 文件/目录：`read_file`、`read_file_lines`、`list_dir`、`walk_dir`、`get_dir_tree`、`get_file_info`
-- 搜索：`grep_text`、`grep_source_code`
-- 源码分析：`read_source_file`、`list_source_files`、`extract_functions`、`get_code_metrics`
-- C/C++：`extract_cpp_functions`、`get_source_metrics`、`find_cmake_files`、`read_compile_commands`
-- Git：`git_status`、`git_diff`、`git_show`
-- 可视化/数据：`generate_diagram_description`、`analyze_data_for_chart`
-
-**2) 受控执行工具（`mcp_exec_safe.py`）**：通过白名单与开关控制“可执行动作”。
-
-- 命令执行（白名单）：`run_safe_command`
-- 代码质量/测试：`analyze_code`、`run_tests`、`check_syntax`
-- C/C++：`run_cpp_linter`、`check_cpp_syntax`
-- 格式化（需要显式允许写入）：`format_code`、`format_cpp`
-
-**3) 产物写入工具（`mcp_artifacts.py`）**：只允许写到 `artifacts/`（或 `MCP_ARTIFACTS_PREFIX`）下。
-
-- 写目录/文件：`ensure_dir`、`write_text_file`
-- 图表：`save_mermaid_diagram`、`create_plotly_chart`、`save_chart_data`
-
-**4) 危险 Shell 工具（`mcp_shell.py`）**：`run_bash`（默认禁用）。
-
-**5) 网络工具（可选，`mcp_net.py`）**：提供带域名 allowlist 的 `web_search/web_open/http_get`（默认禁用）。
-
-另外，项目也内置了 Python 版网络工具 `web_tools.py`：`web_search`、`web_open`、`http_get`，由 `SEARCH.BACKEND` 选择后端（`searxng|tavily|serpapi|bing|none`）。
+完整工具名以 `tools/src/my_tools/tools.py` / `tools/src/my_tools/web_tools.py` 中的 `@tool("...")` 声明为准。
 
 ### 角色可用工具集
 
-`llm.py` 的 `init_mcp_tools()` 会把工具组合成不同权限集合（高层含义如下）：
+`src/clawflow/agents/llm.py` 的 `init_mcp_tools()` 会把工具组合成不同权限集合（高层含义如下）：
 
 - `researcher`：只读 + 网络（检索/阅读/grep/代码扫描）
 - `solver`：只读 + 受控执行 + 网络（允许 pytest/格式化等受控动作，受开关限制）
@@ -218,9 +210,9 @@ LangGraph 侧通过 `mcp_adapter.py` 启动子进程并拉取 tool schema，`llm
 
 ### 如何新增/扩展工具
 
-1) 在 `tools.py` 里新增一个 `@tool("...")` 方法并实现逻辑
-2) 在对应的 `mcp_ro.py` / `mcp_exec_safe.py` / `mcp_artifacts.py` 中增加一个同名 proxy（调用 `TOOL_REGISTRY[tool_name].invoke(...)`）
-3) 需要的话，在 `llm.py:init_mcp_tools()` 的角色分组里把新工具纳入对应角色
+1) 在 `tools/src/my_tools/tools.py` 里新增一个 `@tool("...")` 方法并实现逻辑
+2) 在对应的 `tools/src/my_tools/mcp_ro.py` / `tools/src/my_tools/mcp_exec_safe.py` / `tools/src/my_tools/mcp_artifacts.py` 中增加一个同名 proxy（调用 `TOOL_REGISTRY[tool_name].invoke(...)`）
+3) 需要的话，在 `src/clawflow/agents/llm.py:init_mcp_tools()` 的角色分组里把新工具纳入对应角色
 
 ## 测试
 
@@ -228,12 +220,12 @@ LangGraph 侧通过 `mcp_adapter.py` 启动子进程并拉取 tool schema，`llm
 pytest -q
 ```
 
-也可以运行内置的“未来日期处理”回归脚本：`run_test.sh`（会用 `RUNTIME_UTC_OVERRIDE` 模拟时间，见 `utils.py:663`）。
+也可以运行内置的“未来日期处理”回归脚本：`scripts/run_test.sh`（会用 `RUNTIME_UTC_OVERRIDE` 模拟时间，相关逻辑见 `src/clawflow/utils/utils.py`）。
 
 ## 备注（安全相关）
 
-- `mcp_shell.py` 提供任意 shell 执行能力，但默认通过 `MCP_SHELL_ENABLED=0` 禁用；如需开启请自行评估风险。
-- `mcp_exec_safe.py` 默认只允许白名单命令；写入类动作（format/pip install 等）有额外开关约束。
+- `tools/src/my_tools/mcp_shell.py` 提供任意 shell 执行能力，但默认通过 `MCP_SHELL_ENABLED=0` 禁用；如需开启请自行评估风险。
+- `tools/src/my_tools/mcp_exec_safe.py` 默认只允许白名单命令；写入类动作（format/pip install 等）有额外开关约束。
 
 ### MCP 安全开关速查
 

@@ -1,5 +1,4 @@
 # LangGraph 多智能体系统配置
-# 此配置文件对应 run_chainlit.sh 中的环境变量设置
 # 配置优先级：环境变量 > 配置文件 > 默认值
 
 # LLM 全局默认配置（会被角色特定配置覆盖）
@@ -34,7 +33,7 @@ workspace:
 
 # 技能目录配置
 skills:
-  dir: "./skills"
+  dir: "/path/to/skills/data"
 
 # 搜索配置
 search:
@@ -55,38 +54,9 @@ python:
   io:
     encoding: "utf-8"
 
-# 角色特定配置（覆盖全局配置）
-# intent: 意图分析角色
-#intent:
-#  provider: "qwen"
-#  model: "qwen2-1.5b-instruct"
-#
-## planner: 规划角色
-#planner:
-#  provider: "qwen"
-#  model: "qwen-max"
-#
-## agent: 执行角色（researcher/solver/writer）
-#agent:
-#  provider: "qwen"
-#  model: "qwen-max"
-#
-#researcher:
-#  provider: "qwen"
-#  model: "qwen-long"
-#
-#solver:
-#  provider: "qwen"
-#  model: "qwen-turbo"
-#
-#writer:
-#  provider: "qwen"
-#  model: "qwen-plus"
-#
-#reflector:
-#  provider: "qwen"
-#  model: "qwen-plus"
-
+checkpointer:
+  provider: "sqlite"
+  db_path: "./checkpoints.sqlite"
 
 intent:
   provider: "qwen"
@@ -117,3 +87,13 @@ writer:
 reflector:
   provider: "qwen"
   model: "qwen-plus"
+
+# MCP 工具加载配置
+mcp:
+  # MCP server 脚本名（也可写绝对路径；若是相对路径则会拼到 scripts_dir 下）
+  servers:
+    ro: "my_tools.mcp_r"
+    exec: "my_tools.mcp_exec_safe"
+    artifacts: "my_tools.mcp_artifacts"
+    net: "my_tools.mcp_net"
+    shell: "my_tools.mcp_shell"

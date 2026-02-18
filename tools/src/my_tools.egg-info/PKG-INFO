@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: my_tools
+Version: 0.1.0
+Summary: Standalone library
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: langchain_core<2,>=1.2.8
+Requires-Dist: mcp<2,>=1.26.0
+Requires-Dist: numpy<3,>=2.4.1
+Requires-Dist: pandas<3,>=2.3.3
+Requires-Dist: plotly<7,>=6.5.2
+Requires-Dist: pydantic<3,>=2.12.5
+Provides-Extra: dev
+Requires-Dist: pytest<9,>=8.3.5; extra == "dev"

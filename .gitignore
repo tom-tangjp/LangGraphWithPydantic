@@ -1,5 +1,5 @@
 .env.example
-config.yaml
+ui_streamlit/config.yaml
 .github/
 .idea/
 __pycache__/
