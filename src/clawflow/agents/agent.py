@@ -287,23 +287,17 @@ async def async_invoke_chat_with_retry(
         end = time.perf_counter()
         logger.info(f"{__name__} 耗时: {end - start:.6f} 秒")
 
-        if env("LOG.LLM.CONTENT", "0") == "1":
-            resp_id = extract_resp_id(resp)
-            finish_reason = extract_finish_reason(resp)
-            tool_calls = extract_tool_calls(resp)
-            _log_event(
-                "llm.chat.meta",
-                role=role,
-                resp_id=resp_id,
-                finish_reason=finish_reason,
-                tool_calls=truncate(json.dumps(tool_calls, ensure_ascii=False), 2000),
-            )
-            _log_event(
-                "llm.chat.content",
-                try_i=0,
-                role=role,
-                preview=truncate(getattr(resp, "content", ""), 800),
-            )
+        # Always log minimal meta; never log full model content (avoid leaking "thinking"/raw output)
+        resp_id = extract_resp_id(resp)
+        finish_reason = extract_finish_reason(resp)
+        tool_calls = extract_tool_calls(resp)
+        _log_event(
+            "llm.chat.meta",
+            role=role,
+            resp_id=resp_id,
+            finish_reason=finish_reason,
+            tool_calls_cnt=len(tool_calls),
+        )
 
         if isinstance(resp, AIMessage):
             _log_event("llm.chat.ok", try_i=0, role=role, llm_meta=ai_meta(resp))

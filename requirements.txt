@@ -3,6 +3,7 @@ docutils==0.22.4
 langchain_core==1.2.7
 langchain_ollama==1.0.1
 langchain_openai==1.1.7
+langchain-google-genai>=2.0.0
 langgraph==1.0.7
 mcp==1.26.0
 PyYAML==6.0.3

@@ -1,4 +1,6 @@
 import json
+import re
+import inspect
 import logging
 import os
 import time
@@ -18,6 +20,16 @@ from langchain_core.runnables import Runnable
 from langchain_core.tools import StructuredTool
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
+
+# Gemini (Google AI Studio) support (optional dependency)
+_GEMINI_IMPORT_ERROR: Exception | None = None
+try:
+    from langchain_google_genai import ChatGoogleGenerativeAI
+except Exception as e:
+    # NOTE: do not crash the whole app if Gemini deps are missing/misconfigured.
+    # Keep the error for later diagnostics.
+    ChatGoogleGenerativeAI = None
+    _GEMINI_IMPORT_ERROR = e
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.constants import START, END
@@ -43,6 +55,7 @@ except ImportError:
     # Fallback: use OpenAIModel with Ollama endpoint directly
     from pydantic_ai.models.openai import OpenAIModel
 
+
     class OllamaProvider:
         def __init__(self, base_url: str, api_key: str = None):
             self.base_url = base_url
@@ -56,7 +69,6 @@ except ImportError:
                 api_key=self.api_key,
                 **kwargs,
             )
-
 
 from src.clawflow.agents.agent import (
     IntentModel,
@@ -106,6 +118,7 @@ _FINAL_STEP_KEYWORDS = ("最终", "总结", "汇总", "结论", "最终答案", 
 # Global tool registry populated by `init_mcp_tools()`.
 # NOTE: must be a real dict (not `typing.Dict[...]`).
 MCP_TOOLS_REGISTRY: Dict[str, Any] = {}
+
 
 def _coerce_step_dict(step: Any, *, default_id: str) -> tuple[dict, bool, str]:
     """将单个 step 归一化为 dict，避免出现 str/模型对象导致 `.get` 崩溃。"""
@@ -203,7 +216,7 @@ def _coerce_steps_list(steps: Any) -> tuple[list[dict], bool, str]:
 
     out: list[dict] = []
     for i, st in enumerate(raw):
-        s2, ch2, r2 = _coerce_step_dict(st, default_id=f"step{i+1}")
+        s2, ch2, r2 = _coerce_step_dict(st, default_id=f"step{i + 1}")
         if ch2:
             changed = True
             reason = reason or r2
@@ -228,12 +241,14 @@ def _normalize_plan_in_state(state: AgentState) -> tuple[AgentState, bool, str]:
     state2["plan"] = plan2
     return state2, True, reason
 
+
 def looks_like_final_step(step: Dict[str, Any]) -> bool:
     title = str(step.get("title") or "")
     task = str(step.get("task") or "")
     acceptance = str(step.get("acceptance") or "")
     s = f"{title} {task} {acceptance}".lower()
     return any(k.lower() in s for k in _FINAL_STEP_KEYWORDS)
+
 
 def tool_result_to_text(res: Any) -> str:
     try:
@@ -244,6 +259,7 @@ def tool_result_to_text(res: Any) -> str:
     except Exception:
         s = repr(res)
     return truncate(s, LLM_TOOL_MSG_MAX_CHARS)
+
 
 def normalize_intent_dict(d: Dict[str, Any]) -> Dict[str, Any]:
     # constraints must be List[str]
@@ -271,6 +287,7 @@ def normalize_intent_dict(d: Dict[str, Any]) -> Dict[str, Any]:
 
     return d
 
+
 def step_local_messages(state: AgentState, step_id: str) -> tuple[list[BaseMessage], dict[str, int]]:
     msgs_all: list[BaseMessage] = list(state.get("messages") or [])
     cursors: dict[str, int] = dict(state.get("step_msg_start") or {})
@@ -288,7 +305,9 @@ def step_local_messages(state: AgentState, step_id: str) -> tuple[list[BaseMessa
 
     return step_msgs, cursors
 
+
 logger = logging.getLogger(__name__)
+
 
 def log_event(level: int, event: str, **fields):
     # Use unified key=value output (keep it on one line when possible)
@@ -307,9 +326,10 @@ def has_orphan_tool_message(msgs: list[BaseMessage]) -> bool:
             return True
     return False
 
+
 @utils.timer
 async def async_invoke_structured_with_retry(
-    llm, msgs, *, role="unknown", retries=3, base_sleep=0.5
+        llm, msgs, *, role="unknown", retries=3, base_sleep=0.5
 ):
     attempt = 0
 
@@ -361,7 +381,7 @@ async def async_invoke_structured_with_retry(
         if isinstance(answer, dict):
             answer["usage_metadata"] = usage
 
-        # Diagnostic log: record basic answer structure regardless of LOG.LLM.CONTENT
+        # Diagnostic log: record basic answer structure (without leaking full model content)
         if isinstance(answer, dict):
             log_event(
                 logging.DEBUG,
@@ -399,28 +419,22 @@ async def async_invoke_structured_with_retry(
                 type=type(answer).__name__,
             )
 
-        if utils.getenv("LOG.LLM.CONTENT", "0") == "1":
-            resp_id = extract_resp_id(answer)
-            finish_reason = extract_finish_reason(answer)
-            tool_calls = extract_tool_calls(answer)
-
-            log_event(
-                logging.INFO,
-                "llm.chat.meta",
-                role=role,
-                resp_id=resp_id,
-                question=msg_preview(msgs),
-                finish_reason=finish_reason,
-                tool_calls=json.dumps(tool_calls, ensure_ascii=False),
-            )
-            log_event(
-                logging.INFO,
-                "llm.chat.content",
-                try_i=try_i,
-                role=role,
-                preview=getattr(answer, "content", ""),
-                usage=json.dumps(usage, ensure_ascii=False),
-            )
+        # Always log minimal meta; never log full model content (avoid leaking "thinking"/raw output)
+        _meta_obj = answer
+        if isinstance(answer, dict) and answer.get("raw") is not None:
+            _meta_obj = answer.get("raw")
+        resp_id = extract_resp_id(_meta_obj)
+        finish_reason = extract_finish_reason(_meta_obj)
+        tool_calls = extract_tool_calls(_meta_obj)
+        log_event(
+            logging.INFO,
+            "llm.chat.meta",
+            role=role,
+            resp_id=resp_id,
+            finish_reason=finish_reason,
+            tool_calls_cnt=len(tool_calls),
+            usage=json.dumps(usage, ensure_ascii=False),
+        )
 
         if isinstance(answer, dict) and answer.get("parsed") is None:
             raw = answer.get("raw")
@@ -629,14 +643,15 @@ async def async_invoke_structured_with_retry(
 
     return await _invoke_once()
 
+
 def mk_chat_ollama(
-    *,
-    model: str,
-    base_url: str,
-    temperature: float,
-    num_ctx: int,
-    num_predict: int,
-    timeout_s: int,
+        *,
+        model: str,
+        base_url: str,
+        temperature: float,
+        num_ctx: int,
+        num_predict: int,
+        timeout_s: int,
 ) -> BaseChatModel:
     if ChatOllama is None:
         raise RuntimeError("langchain_ollama is not installed.")
@@ -678,7 +693,7 @@ def ensure_v1(base_url: str) -> str:
 
 
 def mk_agent_ollama(
-    *, model: str, temperature: float, num_ctx: int, num_predict: int, timeout_s: int
+        *, model: str, temperature: float, num_ctx: int, num_predict: int, timeout_s: int
 ) -> Agent:
     base_url = ensure_v1(OLLAMA_BASE_URL)
 
@@ -711,13 +726,15 @@ def mk_agent_ollama(
 
 
 def mk_chat_openai_compact(
-    *,
-    model: str,
-    api_key: str | None,
-    base_url: str | None,
-    temperature: float,
-    max_tokens: int,
-    timeout_s: int,
+        *,
+        model: str,
+        api_key: str | None,
+        base_url: str | None,
+        temperature: float,
+        max_tokens: int,
+        timeout_s: int,
+        extra_body: Dict[str, Any] | None = None,
+        streaming: bool = False,
 ) -> BaseChatModel:
     if ChatOpenAI is None:
         raise RuntimeError(
@@ -728,7 +745,71 @@ def mk_chat_openai_compact(
     if base_url:
         os.environ.setdefault("OPENAI_BASE_URL", base_url)
 
+    # Compatibility notes:
+    # - `langchain_openai.ChatOpenAI` has historically changed init kwarg names across versions.
+    # - We prefer a single-pass construction based on the current signature.
+    # - If it still fails (unexpected wrapper differences), fall back to the old multi-candidate try.
+    sig = inspect.signature(ChatOpenAI.__init__)
+    params = sig.parameters
+
+    kw: Dict[str, Any] = {}
+
+    # Model name kwarg
+    if "model" in params:
+        kw["model"] = model
+    elif "model_name" in params:
+        kw["model_name"] = model
+    else:
+        # As a last resort, keep the historical name; fallback handles TypeError.
+        kw["model"] = model
+
+    # Common sampling / limit args
+    if "temperature" in params:
+        kw["temperature"] = temperature
+    if "max_tokens" in params:
+        kw["max_tokens"] = max_tokens
+
+    # Provider-specific extensions (e.g., DashScope/Qwen thinking)
+    # `langchain_openai.ChatOpenAI` supports `extra_body` in recent versions; keep best-effort.
+    if extra_body is not None:
+        if "extra_body" in params:
+            kw["extra_body"] = extra_body
+        elif "model_kwargs" in params:
+            # Legacy adapters sometimes accept `model_kwargs`
+            kw["model_kwargs"] = dict(extra_body)
+
+    # Streaming toggle (some reasoning/thinking modes require streaming)
+    if "streaming" in params:
+        kw["streaming"] = streaming
+    elif "stream" in params:
+        kw["stream"] = streaming
+
+    # Auth & base url kwargs
+    if api_key:
+        if "api_key" in params:
+            kw["api_key"] = api_key
+        elif "openai_api_key" in params:
+            kw["openai_api_key"] = api_key
+
+    if base_url:
+        if "base_url" in params:
+            kw["base_url"] = base_url
+        elif "openai_api_base" in params:
+            kw["openai_api_base"] = base_url
+
+    # Timeout kwarg name varies
+    if "timeout" in params:
+        kw["timeout"] = timeout_s
+    elif "request_timeout" in params:
+        kw["request_timeout"] = timeout_s
+
+    if "max_retries" in params:
+        kw["max_retries"] = 2
+
+    kw = {k: v for k, v in kw.items() if v is not None}
+
     candidates = [
+        # Legacy fallback for older/newer langchain_openai wrappers
         dict(
             model=model,
             api_key=api_key,
@@ -773,14 +854,88 @@ def mk_chat_openai_compact(
         event_hooks={"request": [log_request], "response": [log_response]},
     )
 
-    last: Exception | None = None
-    for kw in candidates:
-        try:
-            return ChatOpenAI(**{k: v for k, v in kw.items() if v is not None}, http_async_client=http_async_client, http_client=http_client)
-        except TypeError as e:
-            last = e
-            continue
-    raise last or RuntimeError("Failed to construct ChatOpenAI")
+    # First try: signature-adaptive kwargs
+    try:
+        return ChatOpenAI(
+            **kw,
+            http_async_client=http_async_client,
+            http_client=http_client,
+        )
+    except TypeError as first_err:
+        # Fallback: multi-candidate try (historical behavior)
+        last: Exception | None = first_err
+        for cand in candidates:
+            try:
+                return ChatOpenAI(
+                    **{k: v for k, v in cand.items() if v is not None},
+                    http_async_client=http_async_client,
+                    http_client=http_client,
+                )
+            except TypeError as e:
+                last = e
+                continue
+        raise last or RuntimeError("Failed to construct ChatOpenAI")
+
+
+def mk_chat_google_genai(
+        *,
+        model: str,
+        api_key: str | None,
+        temperature: float,
+        max_tokens: int,
+        timeout_s: int,
+) -> BaseChatModel:
+    if ChatGoogleGenerativeAI is None or not callable(ChatGoogleGenerativeAI):
+        detail = ""
+        if _GEMINI_IMPORT_ERROR is not None:
+            detail = f" | import_error={type(_GEMINI_IMPORT_ERROR).__name__}: {_GEMINI_IMPORT_ERROR}"
+        raise RuntimeError(
+            "Gemini provider is not available: `langchain_google_genai.ChatGoogleGenerativeAI` not loaded. "
+            "Install/repair deps via `pip install langchain-google-genai` (and ensure compatible langchain_core)."
+            + detail
+        )
+
+    # Compatibility notes:
+    # - `ChatGoogleGenerativeAI` init kwargs may differ across versions.
+    # - Prefer signature-adaptive kwargs (similar to mk_chat_openai_compact).
+    sig = inspect.signature(ChatGoogleGenerativeAI.__init__)
+    params = sig.parameters
+
+    kw: Dict[str, Any] = {}
+
+    # Model name kwarg
+    if "model" in params:
+        kw["model"] = model
+    elif "model_name" in params:
+        kw["model_name"] = model
+    else:
+        kw["model"] = model
+
+    # API key kwarg name varies; also set env as fallback
+    if api_key:
+        if "google_api_key" in params:
+            kw["google_api_key"] = api_key
+        elif "api_key" in params:
+            kw["api_key"] = api_key
+        os.environ.setdefault("GOOGLE_API_KEY", api_key)
+
+    if "temperature" in params:
+        kw["temperature"] = temperature
+
+    # Token limit kwarg name varies
+    if "max_output_tokens" in params:
+        kw["max_output_tokens"] = max_tokens
+    elif "max_tokens" in params:
+        kw["max_tokens"] = max_tokens
+
+    # Timeout kwarg name varies; if unsupported, ignore
+    if "timeout" in params:
+        kw["timeout"] = timeout_s
+    elif "request_timeout" in params:
+        kw["request_timeout"] = timeout_s
+
+    kw = {k: v for k, v in kw.items() if v is not None}
+    return ChatGoogleGenerativeAI(**kw)
 
 
 def mk_role_chat(role: str) -> BaseChatModel:
@@ -799,7 +954,8 @@ def mk_role_chat(role: str) -> BaseChatModel:
 
     if model is None or model == "":
         raise RuntimeError(f"Model {key_model} not found.")
-    if base_url is None or base_url == "":
+    # Gemini（Google AI Studio）不需要 base_url；其他 OpenAI-compatible provider 仍校验
+    if provider not in ("ollama", "gemini") and (base_url is None or base_url == ""):
         raise RuntimeError(f"Base URL {key_base_url} not found.")
     if provider.upper() != "OLLAMA" and (api_key is None or api_key == ""):
         raise RuntimeError(f"API key {key_api_key} not found.")
@@ -900,6 +1056,31 @@ def mk_role_chat(role: str) -> BaseChatModel:
             num_predict=num_predict,
             timeout_s=timeout_s,
         )
+    if provider == "gemini":
+        return mk_chat_google_genai(
+            model=model,
+            api_key=api_key,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_s=timeout_s,
+        )
+    # DashScope/Qwen: thinking 模式与 tool_choice/object（function calling）存在兼容性限制。
+    # 经验法则：
+    # - agent（会用工具的节点）可以开启 thinking，但不要强制 tool_choice（保持 auto）。
+    # - intent/planner/reflector（structured 输出节点）必须显式关闭 thinking，避免 400 InvalidParameter。
+    extra_body: Dict[str, Any] | None = None
+    # DashScope/Qwen:
+    # - thinking 模式常见要求：stream=true（否则可能报 non-streaming + thinking 的参数错误）
+    # - thinking 模式不支持 tool_choice=object/required（function calling 强制工具）
+    # 因此：这里默认对 DashScope 开启 streaming；structured 节点尽量关闭 thinking。
+    streaming_flag: bool = False
+    if isinstance(base_url, str) and "dashscope.aliyuncs.com" in base_url:
+        streaming_flag = True  # 更稳：即使 thinking 为默认开启，也不会因 stream=false 触发额外 400
+        if role in ("intent", "planner", "reflector"):
+            extra_body = {"enable_thinking": False}
+        elif role == "agent":
+            extra_body = {"enable_thinking": True}
+
     return mk_chat_openai_compact(
         model=model,
         api_key=api_key,
@@ -907,25 +1088,72 @@ def mk_role_chat(role: str) -> BaseChatModel:
         temperature=temperature,
         max_tokens=max_tokens,
         timeout_s=timeout_s,
+        extra_body=extra_body,
+        streaming=streaming_flag,
     )
 
 
 def with_structured(llm: Runnable, schema_model: Any) -> Runnable:
-    """Return a model wrapper that reliably produces `schema_model`.
+    """
+    Return a wrapper that produces `schema_model` and returns a dict shaped like
+    LangChain's `with_structured_output(..., include_raw=True)`:
 
-    Rationale:
-    - For OpenAI-compatible providers, `function_calling` is usually the most reliable.
-    - For Ollama (local models), tool/function calling support is inconsistent across models and
-      LangChain adapters; prefer JSON-schema / JSON-mode.
+        {"raw": AIMessage, "parsed": <schema_model>|None, "parsing_error": str|None}
+
+    Why this exists (DashScope/Qwen):
+    - DashScope "thinking mode" rejects `tool_choice` when it is set to an object/required.
+    - LangChain's `method="function_calling"` forces `tool_choice={"type":"function",...}`.
+    - Therefore for DashScope we MUST avoid function calling for structured outputs, and instead:
+        (1) prompt for strict JSON-only output
+        (2) parse JSON locally into the pydantic model
+
+    For Ollama/Gemini we keep the original behavior.
     """
 
-    # Best-effort detect Ollama. (Avoid importing provider globals here.)
+    # Provider detection helpers (robust across langchain_openai versions)
+    def _get_base_url(x: Any) -> str:
+        for attr in ("base_url", "openai_api_base"):
+            v = getattr(x, attr, None)
+            if isinstance(v, str) and v:
+                return v
+        for c_attr in ("client", "_client", "async_client", "_async_client"):
+            c = getattr(x, c_attr, None)
+            if c is None:
+                continue
+            v = getattr(c, "base_url", None)
+            if v:
+                return str(v)
+        # Fallback: env that mk_chat_openai_compact sets
+        return os.environ.get("OPENAI_BASE_URL", "") or ""
+
+    def _is_dashscope(x: Any) -> bool:
+        bu = _get_base_url(x)
+        return isinstance(bu, str) and ("dashscope.aliyuncs.com" in bu)
+
+    def _schema_json(sm: Any) -> dict:
+        # pydantic v2
+        if hasattr(sm, "model_json_schema"):
+            return sm.model_json_schema()
+        # pydantic v1
+        if hasattr(sm, "schema"):
+            return sm.schema()
+        return {}
+
+    def _validate(sm: Any, obj: Any):
+        # pydantic v2
+        if hasattr(sm, "model_validate"):
+            return sm.model_validate(obj)
+        # pydantic v1
+        if hasattr(sm, "parse_obj"):
+            return sm.parse_obj(obj)
+        # Fallback
+        return sm(**obj)
+
+    # Best-effort detect Ollama/Gemini.
     is_ollama = (ChatOllama is not None) and isinstance(llm, ChatOllama)
+    is_gemini = (ChatGoogleGenerativeAI is not None) and isinstance(llm, ChatGoogleGenerativeAI)
 
     if is_ollama:
-        # Ensure the Ollama backend is nudged into JSON output when possible.
-        # `format="json"` is supported by Ollama Chat API; if the adapter rejects it,
-        # fallback will still work with json_schema/json_mode prompts.
         try:
             llm = llm.bind(format="json")
         except Exception:
@@ -933,27 +1161,72 @@ def with_structured(llm: Runnable, schema_model: Any) -> Runnable:
 
         for m in get_args(Literal["json_mode", "json_schema"]):
             try:
-                return llm.with_structured_output(
-                    schema_model, method=m, include_raw=True
-                )
+                return llm.with_structured_output(schema_model, method=m, include_raw=True)
             except Exception:
                 continue
-        # Last resort: let LangChain pick a default method.
         return llm.with_structured_output(schema_model, include_raw=True)
 
-    # Non-Ollama: try function calling first.
-    try:
-        return llm.with_structured_output(
-            schema_model, method="function_calling", include_raw=True
-        )
-    except Exception:
-        # Fallback (some compat providers prefer json_schema)
+    if is_gemini:
         try:
-            return llm.with_structured_output(
-                schema_model, method="json_schema", include_raw=True
-            )
+            return llm.with_structured_output(schema_model, method="json_schema", include_raw=True)
         except Exception:
             return llm.with_structured_output(schema_model, include_raw=True)
+
+    # DashScope/Qwen: avoid function_calling (tool_choice object) completely.
+    if _is_dashscope(llm):
+        schema = _schema_json(schema_model)
+        schema_str = json.dumps(schema, ensure_ascii=False)
+
+        json_only_system = (
+            "你是一个严格的 JSON 生成器。\n"
+            "只输出一个 JSON 对象，禁止输出任何解释、Markdown、代码块、前后缀文本。\n"
+            "JSON 必须能被标准 JSON 解析器直接解析。\n"
+            "请严格遵循下面的 JSON Schema（字段名/类型/必填）：\n"
+            f"{schema_str}"
+        )
+
+        class _DashScopeJSONStructuredWrapper:
+            def __init__(self, base_llm):
+                self._base = base_llm
+
+            def invoke(self, msgs, **kwargs):
+                # Sync fallback
+                raw = self._base.invoke([SystemMessage(content=json_only_system), *msgs])
+                return self._wrap(raw)
+
+            async def ainvoke(self, msgs, **kwargs):
+                raw = await self._base.ainvoke([SystemMessage(content=json_only_system), *msgs])
+                return self._wrap(raw)
+
+            def _wrap(self, raw_msg: Any) -> dict:
+                text = extract_text_content(raw_msg)
+                parsed = None
+                err = None
+                try:
+                    obj = try_parse_json(text)
+                    if obj is None:
+                        # Best-effort: extract first {...} block
+                        m = re.search(r"\{[\s\S]*\}", text)
+                        if m:
+                            obj = json.loads(m.group(0))
+                    if obj is None:
+                        raise ValueError("failed to parse json from model output")
+                    parsed = _validate(schema_model, obj)
+                except Exception as e:
+                    err = f"{type(e).__name__}: {e}"
+                return {"raw": raw_msg, "parsed": parsed, "parsing_error": err}
+
+        return _DashScopeJSONStructuredWrapper(llm)
+
+    # Non-DashScope OpenAI-compatible: try function calling first.
+    try:
+        return llm.with_structured_output(schema_model, method="function_calling", include_raw=True)
+    except Exception:
+        try:
+            return llm.with_structured_output(schema_model, method="json_schema", include_raw=True)
+        except Exception:
+            return llm.with_structured_output(schema_model, include_raw=True)
+
 
 @utils.timer
 async def tool_invoke(tool_obj: Any, args: Dict[str, Any]) -> Any:
@@ -994,6 +1267,7 @@ async def tool_invoke(tool_obj: Any, args: Dict[str, Any]) -> Any:
     logger.error(f"ERROR: {type(tool_obj)} is not invokable.")
 
     raise TypeError(f"Tool {tool_obj!r} is not invokable.")
+
 
 @utils.timer
 async def safe_tool_node(state: AgentState) -> Dict[str, Any]:
@@ -1064,6 +1338,7 @@ async def safe_tool_node(state: AgentState) -> Dict[str, Any]:
 
     return {"messages": new_msgs}
 
+
 def _is_module_spec(s: str) -> bool:
     """Return True if s looks like a Python module path or an explicit module: spec."""
     t = (s or "").strip()
@@ -1115,6 +1390,7 @@ def _resolve_mcp_entry(entry: str) -> str:
     base = _my_tools_pkg_dir()
     return str((base / p).resolve())
 
+
 def update_global_registry(tools: List[StructuredTool]):
     """
     Update the global MCP_TOOLS_REGISTRY in tools.py with the given tools.
@@ -1124,6 +1400,7 @@ def update_global_registry(tools: List[StructuredTool]):
         # Also add sanitized names if needed, similar to build_tool_registry
         MCP_TOOLS_REGISTRY[t.name.strip()] = t
         MCP_TOOLS_REGISTRY[t.name.strip().lower()] = t
+
 
 async def init_mcp_tools() -> Dict[str, List]:
     """
@@ -1173,7 +1450,7 @@ async def init_mcp_tools() -> Dict[str, List]:
     # Update global registry for safe_tool_node
     all_tools = ro_tools + exec_tools + artifact_tools + web_tools + shell_tools
     update_global_registry(all_tools)
-    
+
     return {
         "ro": ro_tools + web_tools + shell_tools,
         "exec": ro_tools + exec_tools + web_tools + shell_tools,
@@ -1186,6 +1463,7 @@ async def init_mcp_tools() -> Dict[str, List]:
         "code_reviewer": all_tools,
     }
 
+
 def build_llm():
     intent_base = mk_role_chat("intent")
     planner_base = mk_role_chat("planner")
@@ -1197,11 +1475,12 @@ def build_llm():
 
     # Tool-enabled agent LLM (base only, tools bound later)
     agent_base = mk_role_chat("agent")
-    
+
     # Plain LLM (no tools) used by final responder.
     responder_llm: BaseChatModel = agent_base
 
     return intent_llm, planner_llm, agent_base, reflector_llm, responder_llm
+
 
 @utils.timer
 async def intent_node(state, intent_llm):
@@ -1247,6 +1526,7 @@ async def intent_node(state, intent_llm):
         "intent": intent_dict,
         "usage_metadata": usage,
     }
+
 
 @utils.timer
 async def initial_plan_node(state: AgentState, llm) -> Dict[str, Any]:
@@ -1359,7 +1639,6 @@ async def initial_plan_node(state: AgentState, llm) -> Dict[str, Any]:
         ][:12],
     )
 
-
     return {
         "plan": plan_obj,
         "step_idx": 0,
@@ -1374,9 +1653,10 @@ async def initial_plan_node(state: AgentState, llm) -> Dict[str, Any]:
         "step_failures": {},
         "no_progress": {},
         "last_feedback": {},
-        "plan_review_feedback": None, # Clear old review feedback
+        "plan_review_feedback": None,  # Clear old review feedback
         "usage_metadata": plan_usage,  # Add token usage
     }
+
 
 @utils.timer
 async def dynamic_plan_node(state: AgentState, llm) -> Dict[str, Any]:
@@ -1464,17 +1744,17 @@ async def dynamic_plan_node(state: AgentState, llm) -> Dict[str, Any]:
     # === Fix: append new steps to the existing plan to keep step_idx continuity ===
     existing_plan = state.get("plan") or {}
     existing_steps = existing_plan.get("steps") or []
-    
+
     # Preserve the original plan objective when possible
     if existing_plan.get("objective"):
         plan_obj["objective"] = existing_plan["objective"]
-    
+
     # Dedup: ensure newly generated steps don't duplicate existing ones (by hash)
     seen = set(state.get("seen_step_hashes", []))
     for s in existing_steps:
         s_dict = s.model_dump() if hasattr(s, "model_dump") else s
         seen.add(hash_step(s_dict))
-        
+
     dedup_new_steps = []
     for st in new_steps:
         st_dict = st.model_dump() if hasattr(st, "model_dump") else st
@@ -1482,7 +1762,7 @@ async def dynamic_plan_node(state: AgentState, llm) -> Dict[str, Any]:
         if h in seen:
             continue
         dedup_new_steps.append(st_dict)
-        
+
     if not dedup_new_steps:
         # If dedup results in no new steps but we still need one, fall back to a default step
         dedup_new_steps = [{
@@ -1498,7 +1778,7 @@ async def dynamic_plan_node(state: AgentState, llm) -> Dict[str, Any]:
     # Merge plans
     final_steps = existing_steps + dedup_new_steps
     plan_obj["steps"] = final_steps
-    
+
     # Keep pending_steps for debugging
     pending_steps = state.get("pending_steps", [])
     pending_steps.extend(dedup_new_steps)
@@ -1515,7 +1795,6 @@ async def dynamic_plan_node(state: AgentState, llm) -> Dict[str, Any]:
         ][:12],
     )
 
-
     return {
         "plan": plan_obj,
         "executed_steps": executed_steps,
@@ -1530,20 +1809,21 @@ async def dynamic_plan_node(state: AgentState, llm) -> Dict[str, Any]:
         "step_failures": {},
         "no_progress": {},
         "last_feedback": {},
-        "plan_review_feedback": None, # Clear old review feedback
+        "plan_review_feedback": None,  # Clear old review feedback
         "usage_metadata": plan_usage,  # Add token usage
     }
+
 
 @utils.timer
 async def plan_reviewer_node(state: AgentState, llm) -> Dict[str, Any]:
     plan = state.get("plan")
     user_req = state.get("user_request")
-    
+
     msgs = [
         SystemMessage(content=PLAN_REVIEW_SYSTEM),
         HumanMessage(content=f"用户需求：{user_req}\n\n待审核计划（JSON）：{json.dumps(plan, ensure_ascii=False)}")
     ]
-    
+
     try:
         review_model = await async_invoke_structured_with_retry(
             llm, msgs, role="plan_reviewer", retries=2
@@ -1556,32 +1836,33 @@ async def plan_reviewer_node(state: AgentState, llm) -> Dict[str, Any]:
 
     decision = review_obj.get("decision", "approve")
     feedback = review_obj.get("feedback", "")
-    
+
     log_event(
         logging.INFO,
         "plan_review.done",
         decision=decision,
         feedback=truncate(feedback, 200)
     )
-    
+
     updates = {
         "plan_review_feedback": feedback if decision == "reject" else None,
     }
-    
+
     if decision == "reject":
         # Reject logic: return to the originating planning node
         # We need to know if we came from initial_plan or dynamic_plan.
         # However, in the current new design, Reviewer ONLY serves Dynamic Plan.
         # But to be safe and generic, we can check if executed_steps is empty.
-        
-        # Or simpler: The user requested Reviewer ONLY for Dynamic Plan. 
+
+        # Or simpler: The user requested Reviewer ONLY for Dynamic Plan.
         # So we default rejection to "dynamic_plan".
         # (If we ever reconnect Initial Plan -> Reviewer, we'd need a flag in state like "last_plan_source")
         updates["next_node"] = "dynamic_plan"
     else:
         updates["next_node"] = "route"
-        
+
     return updates
+
 
 # ===== Skills injection (B + optional C) =====
 # B: System-side retrieval of top-k skill cards relevant to the current task and compatible with the role toolset.
@@ -1591,6 +1872,8 @@ SKILL_CARD_TOPK = int(os.getenv("SKILL_CARD_TOPK", "8") or 8)
 SKILL_SELECT_TOPK = int(os.getenv("SKILL_SELECT_TOPK", "2") or 2)  # keep small to control token cost
 SKILL_CONTEXT_MAX_CHARS = int(os.getenv("SKILL_CONTEXT_MAX_CHARS", "12000") or 12000)
 SKILL_SELECT_MODE = str(os.getenv("SKILL_SELECT_MODE", "b+c") or "b+c").lower()
+
+
 # Modes:
 # - "off": disable skills injection
 # - "b": inject only skill cards (summary)
@@ -1598,9 +1881,12 @@ SKILL_SELECT_MODE = str(os.getenv("SKILL_SELECT_MODE", "b+c") or "b+c").lower()
 # - "heuristic": same as "b" but deterministically pick top-N skills without LLM routing
 # Default is "b+c".
 class SkillSelectModel(BaseModel):
-    selected_skill_ids: List[str] = Field(default_factory=list, description="Select up to SKILL_SELECT_TOPK skill ids from the provided candidates.")
+    selected_skill_ids: List[str] = Field(default_factory=list,
+                                          description="Select up to SKILL_SELECT_TOPK skill ids from the provided candidates.")
+
 
 _SKILL_SELECT_LLM = None
+
 
 def _get_skill_select_llm():
     global _SKILL_SELECT_LLM
@@ -1608,6 +1894,7 @@ def _get_skill_select_llm():
         # Use a tool-free model; structured output ensures we get a parseable list.
         _SKILL_SELECT_LLM = with_structured(mk_role_chat("planner"), SkillSelectModel)
     return _SKILL_SELECT_LLM
+
 
 def _tool_names(role_tools: Optional[List[Any]]) -> List[str]:
     if not role_tools:
@@ -1619,6 +1906,7 @@ def _tool_names(role_tools: Optional[List[Any]]) -> List[str]:
         if n:
             names.append(n)
     return names
+
 
 async def _build_skill_injection(role: str, role_tools: Optional[List[Any]], query_text: str) -> str:
     if SKILL_SELECT_MODE in ("off", "0", "false", "none"):
@@ -1665,9 +1953,9 @@ async def _build_skill_injection(role: str, role_tools: Optional[List[Any]], que
     ans = await async_invoke_structured_with_retry(
         selector,
         select_msgs,
-        role = role,
-        retries = 2,
-        base_sleep = 0.3,
+        role=role,
+        retries=2,
+        base_sleep=0.3,
     )
 
     raw = getattr(ans, "selected_skill_ids", None)
@@ -1687,6 +1975,7 @@ async def _build_skill_injection(role: str, role_tools: Optional[List[Any]], que
     docs_text = SKILL_REGISTRY.render_full_docs(selected_ids, max_chars_total=SKILL_CONTEXT_MAX_CHARS)
     return cards_text + "\n\n" + docs_text if docs_text else cards_text
 
+
 # ===== End Skills injection =====
 
 def _tool_allowed_roles() -> set[str]:
@@ -1694,17 +1983,19 @@ def _tool_allowed_roles() -> set[str]:
     # planner/router/reflector usually skip injection to save tokens
     return {"solver", "code_researcher", "code_reviewer"}
 
+
 @utils.timer
 def agent_node(role: str, llm: BaseChatModel, role_tools: Optional[List[Any]] = None):
     """
     Step executor (Scheme B). Tools are executed only by ToolNode.
     Token-optimized: only feed step-local messages + required dependency artifacts.
     """
+
     @utils.timer
     async def _node(state: AgentState) -> Dict[str, Any]:
         step_idx = int(state.get("step_idx", 0) or 0)
-        step = current_step(state) or {"id": f"step{step_idx+1}", "task": "No task", "acceptance": ""}
-        step_id = str(step.get("id") or f"step{step_idx+1}")
+        step = current_step(state) or {"id": f"step{step_idx + 1}", "task": "No task", "acceptance": ""}
+        step_id = str(step.get("id") or f"step{step_idx + 1}")
 
         plan = state.get("plan") or {}
         steps = plan.get("steps") or []
@@ -1740,7 +2031,7 @@ def agent_node(role: str, llm: BaseChatModel, role_tools: Optional[List[Any]] = 
         fb = (state.get("last_feedback") or {}).get(step_id) or {}
         fb_text = ""
         if fb:
-            fb_text = f"\n\n【审阅意见】\n原因：{fb.get('reason','')}\n要求：{fb.get('required_changes', [])}"
+            fb_text = f"\n\n【审阅意见】\n原因：{fb.get('reason', '')}\n要求：{fb.get('required_changes', [])}"
 
         # If returning from tools, force no more tool calls
         last_msg = step_msgs[-1] if step_msgs else None
@@ -1749,10 +2040,10 @@ def agent_node(role: str, llm: BaseChatModel, role_tools: Optional[List[Any]] = 
         if returning_from_tools:
             user_prompt = (
                 f"你是 {role} 角色。\n"
-                f"[Step {step_idx+1}/{max(len(steps),1)} 状态更新]\n"
+                f"[Step {step_idx + 1}/{max(len(steps), 1)} 状态更新]\n"
                 f"检测到工具输出已返回（上方 ToolMessage）。\n"
-                f"原任务：{step.get('task','')}\n"
-                f"验收标准：{step.get('acceptance','')}\n"
+                f"原任务：{step.get('task', '')}\n"
+                f"验收标准：{step.get('acceptance', '')}\n"
                 f"最高优先级指令：\n"
                 f"1) 禁止再调用任何工具（包括 web_search 等）。\n"
                 f"2) 直接基于 ToolMessage 输出本步骤结果。\n"
@@ -1762,9 +2053,9 @@ def agent_node(role: str, llm: BaseChatModel, role_tools: Optional[List[Any]] = 
         else:
             user_prompt = (
                 f"你是 {role} 角色。请完成当前 step 的任务。\n"
-                f"[Step {step_idx+1}/{max(len(steps),1)}]\n"
-                f"任务：{step.get('task','')}\n"
-                f"验收标准：{step.get('acceptance','')}\n"
+                f"[Step {step_idx + 1}/{max(len(steps), 1)}]\n"
+                f"任务：{step.get('task', '')}\n"
+                f"验收标准：{step.get('acceptance', '')}\n"
                 f"当前重试次数：{fails}\n"
                 f"专注原则：仅执行当前 Task。满足验收标准后立刻停止。\n"
                 f"{AGENT_RETRY_INSTRUCTION if fails > 0 else ''}"
@@ -1818,8 +2109,8 @@ def agent_node(role: str, llm: BaseChatModel, role_tools: Optional[List[Any]] = 
         artifacts[step_id] = {
             "role": role,
             "content": new_text,
-            "acceptance": str(step.get("acceptance","")),
-            "task": str(step.get("task","")),
+            "acceptance": str(step.get("acceptance", "")),
+            "task": str(step.get("task", "")),
             "attempt": fails + 1,
             "tool_calls_count": int(tool_stats.get(step_id, 0)),
         }
@@ -1838,6 +2129,7 @@ def agent_node(role: str, llm: BaseChatModel, role_tools: Optional[List[Any]] = 
 
     return _node
 
+
 @utils.timer
 async def respond_node(state: AgentState, responder_llm: BaseChatModel):
     # Defensive: normalize steps to avoid `.get` crash if steps contain str
@@ -1854,17 +2146,17 @@ async def respond_node(state: AgentState, responder_llm: BaseChatModel):
         a = artifacts.get(step_id, {})
         out = truncate(a.get("content", ""), 1200)
         results.append(
-            f"- Step {i+1} ({step_id}) role={a.get('role','')} attempt={a.get('attempt','')}\n"
-            f"  task={truncate(s.get('task',''), 300)}\n"
+            f"- Step {i + 1} ({step_id}) role={a.get('role', '')} attempt={a.get('attempt', '')}\n"
+            f"  task={truncate(s.get('task', ''), 300)}\n"
             f"  output={out}"
         )
 
     msgs = [
         SystemMessage(content=RESPOND_SYSTEM + "\n\n【硬性约束】禁止调用工具；直接输出最终答复文本。"),
         HumanMessage(content=(
-            f"用户原始请求：{user_request}\n\n"
-            f"请基于以下步骤产出合并最终答复：\n" + "\n".join(results) +
-            (f"\n\n【审阅记录】{json.dumps(reflections, ensure_ascii=False)}" if reflections else "")
+                f"用户原始请求：{user_request}\n\n"
+                f"请基于以下步骤产出合并最终答复：\n" + "\n".join(results) +
+                (f"\n\n【审阅记录】{json.dumps(reflections, ensure_ascii=False)}" if reflections else "")
         )),
     ]
 
@@ -1874,6 +2166,7 @@ async def respond_node(state: AgentState, responder_llm: BaseChatModel):
     return {
         "final_answer": answer,
     }
+
 
 @utils.timer
 async def route_node(state: AgentState) -> Dict[str, Any]:
@@ -1901,6 +2194,7 @@ async def route_node(state: AgentState) -> Dict[str, Any]:
     return {
         "iter_count": iter_count,
     }
+
 
 @utils.timer
 async def reflect_node(state: AgentState, llm) -> Dict[str, Any]:
@@ -1979,7 +2273,7 @@ async def reflect_node(state: AgentState, llm) -> Dict[str, Any]:
         "reflections": reflections,
         "no_progress": no_progress,
         "next_node": "route",
-        "need_plan_update": False,   # Default: do not trigger dynamic_plan
+        "need_plan_update": False,  # Default: do not trigger dynamic_plan
     }
 
     # ---- retry ----
@@ -2058,6 +2352,7 @@ async def reflect_node(state: AgentState, llm) -> Dict[str, Any]:
     updates["step_idx"] = idx + 1
     return updates
 
+
 @utils.timer
 def route_after_plan_review(state: AgentState) -> str:
     nxt = state.get("next_node")
@@ -2066,6 +2361,7 @@ def route_after_plan_review(state: AgentState) -> str:
     if nxt == "initial_plan":
         return "initial_plan"
     return "route"
+
 
 @utils.timer
 def route_after_route(state: AgentState) -> str:
@@ -2093,15 +2389,19 @@ def route_after_route(state: AgentState) -> str:
     agent = cur.get("agent", "writer") if isinstance(cur, dict) else "writer"
     return agent
 
+
 # Router functions
 def route_after_intent(state: AgentState) -> str:
     return "initial_plan"
 
+
 def route_after_initial_plan(state: AgentState) -> str:
     return "route"
 
+
 def route_after_dynamic_plan(state: AgentState) -> str:
     return "route"
+
 
 @utils.timer
 def route_after_agent(state: AgentState) -> str:
@@ -2113,6 +2413,7 @@ def route_after_agent(state: AgentState) -> str:
     if tool_calls:
         return "tools"
     return "reflect"
+
 
 @utils.timer
 def route_after_tools(state: AgentState) -> str:
@@ -2162,6 +2463,7 @@ def route_after_tools(state: AgentState) -> str:
 
     return role
 
+
 @utils.timer
 def route_after_reflect(state: AgentState) -> str:
     if state.get("done"):
@@ -2180,16 +2482,16 @@ def route_after_reflect(state: AgentState) -> str:
 
 
 def build_reflection_multi_agent_graph(
-    intent_base: BaseChatModel,
-    planner_llm: BaseChatModel,
-    agent_base: BaseChatModel,
-    reflector_llm: BaseChatModel,
-    responder_llm: Optional[BaseChatModel] = None,
-    tool_map: Dict[str, List] = None,
-    checkpointer: Optional[BaseCheckpointSaver] = None,
+        intent_base: BaseChatModel,
+        planner_llm: BaseChatModel,
+        agent_base: BaseChatModel,
+        reflector_llm: BaseChatModel,
+        responder_llm: Optional[BaseChatModel] = None,
+        tool_map: Dict[str, List] = None,
+        checkpointer: Optional[BaseCheckpointSaver] = None,
 ):
     """
-    Build the graph. 
+    Build the graph.
     tool_map: mapping from role name to list of tools.
     """
 
@@ -2220,10 +2522,10 @@ def build_reflection_multi_agent_graph(
         # Bind tools specific to the role
         tools = tool_map.get(role, [])
         if tools:
-            bound_llm = agent_base.bind_tools(tools)
+            bound_llm = agent_base.bind_tools(tools, tool_choice="auto")
         else:
             bound_llm = agent_base
-            
+
         return agent_node(role, bound_llm, tools)
 
     async def _reflect(s: AgentState) -> Dict[str, Any]:

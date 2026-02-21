@@ -31,6 +31,10 @@ def normalize_provider(p: str) -> str:
         "openai": "openai",
         "ollama": "ollama",
         "deepseek": "deepseek",
+        "gemini": "gemini",
+        "google": "gemini",
+        "genai": "gemini",
+        "google_genai": "gemini",
     }
     return aliases.get(p, p)
 
@@ -47,12 +51,14 @@ def check_llm_provider(provider: str, model: str) -> bool:
     # if get_config(key_model, default="") == "":
     #     logger.error(f"LLM provider {lower_provider} not configured. Please set {key_model} in config.")
     #     return False
-    key_uri = f"{key_provider}.base_url"
-    if get_config(key_uri, default="") == "":
-        logger.error(
-            f"LLM provider {lower_provider} base_url not configured. Please set {key_uri} in config."
-        )
-        return False
+    # Gemini（Google AI Studio）不依赖 base_url
+    if lower_provider != "gemini":
+        key_uri = f"{key_provider}.base_url"
+        if get_config(key_uri, default="") == "":
+            logger.error(
+                f"LLM provider {lower_provider} base_url not configured. Please set {key_uri} in config."
+            )
+            return False
     key_api_key = f"{key_provider}.api_key"
     if lower_provider != "ollama" and get_config(key_api_key, default="") == "":
         logger.error(
