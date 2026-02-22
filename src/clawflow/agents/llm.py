@@ -299,9 +299,31 @@ def step_local_messages(state: AgentState, step_id: str) -> tuple[list[BaseMessa
     start = int(cursors.get(step_id, 0) or 0)
     step_msgs = msgs_all[start:]
 
-    # cap by message count
-    if len(step_msgs) > LLM_STEP_HISTORY_MAX_MSGS:
-        step_msgs = step_msgs[-LLM_STEP_HISTORY_MAX_MSGS:]
+    # Tool-call protocol safety:
+    # A ToolMessage must be a response to a preceding AIMessage with tool_calls.
+    # The step cursor and naive truncation can cut off that AIMessage and leave an orphan ToolMessage,
+    # which will cause OpenAI-compatible providers to return 400.
+    if step_msgs and isinstance(step_msgs[0], ToolMessage):
+        # Best effort: if the message immediately before the cursor is the tool_calls AIMessage,
+        # include it to form a valid tool block.
+        if (
+            start > 0
+            and isinstance(msgs_all[start - 1], AIMessage)
+            and getattr(msgs_all[start - 1], "tool_calls", None)
+        ):
+            step_msgs = [msgs_all[start - 1]] + step_msgs
+        else:
+            # Fallback: drop leading ToolMessage(s) (better than sending an invalid sequence)
+            while step_msgs and isinstance(step_msgs[0], ToolMessage):
+                step_msgs.pop(0)
+
+    # Cap by message count, but keep tool-call blocks intact.
+    # NOTE: tail_messages_tool_safe may keep a few extra messages to complete the protocol.
+    step_msgs = utils.tail_messages_tool_safe(
+        step_msgs,
+        max_keep=LLM_STEP_HISTORY_MAX_MSGS,
+        extra_keep=8,
+    )
 
     return step_msgs, cursors
 
